@@ -20,31 +20,6 @@ import matplotlib.pyplot as plt
 
 import dimod
 
-# Import the Julia OIM module
-from julia.api import Julia
-from julia import Main
-
-# Initialize Julia
-Julia(compiled_modules=False)
-
-# Activate the Julia environment
-from julia import Pkg
-Pkg.activate(".")
-Pkg.instantiate()
-
-# Include the Julia module
-module_path = os.path.join("..", "oim-simulator", "code", "core", "simulations", "oim_simulations.jl")
-Main.include(module_path)
-
-# Access the module via Main
-OIMSimulations = Main.OIMSimulations
-
-# Access the function directly
-oim_problem_solver = OIMSimulations.oim_problem_solver
-simple_oim_dynamics = OIMSimulations.simple_oim_dynamics
-
-
-
 
 
 
@@ -316,8 +291,7 @@ def generate_digits(args):
     # Random_state sets reproducible seed for shuffle
     x_train, x_test, y_train, y_test = train_test_split(digits.data, digits.target, test_size=0.1, random_state=10, shuffle=True)
 
-    # TODO check if normalization needs to be changed
-    normalisation = 8
+    normalisation = 8 # Apparently scikitlearn digits are in [0,16] so normalise by 8 to get [0,2] so mappable to [-1,1]
     x_train, x_test = x_train / normalisation, x_test / normalisation
 
     # Use ReshapeTransformTarget to reshape the target labels to one-hot encoding on multiple output neurons per class if needed
@@ -426,42 +400,6 @@ def generate_mnist(args):
 
 ########## BINARY QUADRATIC MODEL (BQM) FUNCTIONS ##########
 
-# def createIsingProblem(net, args, input, beta = 0, target = None, simulated = 1): # TODO delete if new method works
-
-#     with torch.no_grad():
-
-#         ### BIASES
-
-#         # Use bias trick to encode the input layer 
-#         bias_input = np.matmul(input, net.weights_0)
-#         bias_lim = args.bias_lim
-#         h = {idx_loc: (bias + bias_input[idx_loc]).clip(-bias_lim,bias_lim).item() for idx_loc, bias in enumerate(net.bias_0)} # .clip(.,.) from numpy and .item() converts to python scalar
-
-#         # Calculate nudge biases for the output layer if target is provided or use the original biases but clipped to bias_lim if not
-#         if target is not None:
-#             bias_nudge = -beta*target
-
-#             # Note that the output layer biases are indexed from the second layer (hidden) onwards, remembering that the input layer is encoded in the of the hidden layer and don't need biases themselves
-#             h.update({idx_loc + args.layersList[1]: (bias + bias_nudge[idx_loc]).clip(-bias_lim,bias_lim).item() for idx_loc, bias in enumerate(net.bias_1)})
-#         else:
-#             h.update({idx_loc + args.layersList[1]: bias.clip(-bias_lim,bias_lim).item() for idx_loc, bias in enumerate(net.bias_1)})
-
-
-#         ### WEIGHTS
-
-#         J = {}
-
-#         # Weights between hidden and output layer
-#         for k in range(args.layersList[1]):
-#             for j in range(args.layersList[2]):
-#                 # Again the output layer weights are indexed from the second layer (hidden) onwards hence the +args.layersList[1]
-#                 # Here we just clip the weights to -1,1 to turn into a QUBO problem
-#                 J.update({(k,j+args.layersList[1]): net.weights_1[k][j].clip(-1,1)}) # TODO think if want to use clipping or not
-
-#         return h, J
-    
-
-
 def createIsingProblem(net, args, input, beta=0, target=None, simulated=1):
 
     with torch.no_grad():
@@ -469,17 +407,17 @@ def createIsingProblem(net, args, input, beta=0, target=None, simulated=1):
 
         # Use bias trick to encode the input layer
         bias_input = np.matmul(input, net.weights_0)
-        bias_lim = args.bias_lim
+        h_clip = args.h_clip
 
         # Hidden layer biases
-        h_hidden = (net.bias_0 + bias_input).clip(-bias_lim, bias_lim)
+        h_hidden = (net.bias_0 + bias_input).clip(-h_clip, h_clip)
 
         # Output layer biases
         if target is not None:
             bias_nudge = -beta * target
-            h_output = (net.bias_1 + bias_nudge).clip(-bias_lim, bias_lim)
+            h_output = (net.bias_1 + bias_nudge).clip(-h_clip, h_clip)
         else:
-            h_output = net.bias_1.clip(-bias_lim, bias_lim)
+            h_output = net.bias_1.clip(-h_clip, h_clip)
 
         # Combine biases
         h = np.concatenate((h_hidden, h_output))
@@ -487,7 +425,9 @@ def createIsingProblem(net, args, input, beta=0, target=None, simulated=1):
         ### WEIGHTS
 
         # Weights between hidden and output layers
-        weights = net.weights_1.clip(-1, 1)
+        J_clip = args.J_clip
+
+        weights = net.weights_1.clip(-J_clip, J_clip) 
 
         # Number of spins
         num_hidden = args.layersList[1]
@@ -535,176 +475,129 @@ def createIsingProblem(net, args, input, beta=0, target=None, simulated=1):
 
 ########## TRAINING AND TESTING FUNCTIONS ##########
 
-def train(net, args, train_loader, sa_sampler):
+def train(net, args, train_loader, sampler):
     '''
-    function to train the network for 1 epoch
+    function to train the network for 1 epoch with memory optimization
     '''
-
+    import gc  # Add garbage collector import
     total_pred, total_loss = 0, 0
 
     with torch.no_grad():
         print("Training")
-        # Iterate over the training data
-        for idx, (DATA, TARGET) in enumerate(progressbars(train_loader, position=0, leave=True)): # position=0 i.e. progress bar at top, leave=True i.e. progress bar remains after completion
-
-            # These variables are used to store all free/nudge states for the batch (used to calculate loss and error later)
+        for idx, (DATA, TARGET) in enumerate(progressbars(train_loader, position=0, leave=True)):
+            # Force garbage collection at start of each batch
+            gc.collect()
             store_seq = None
             store_s = None
 
+            # Pre-allocate numpy arrays for batch to avoid repeated allocations
+            batch_size = DATA.size()[0]
+            total_size = args.layersList[1] + args.layersList[2]  # Hidden + output size
+            store_seq = np.zeros((batch_size, total_size))
+            store_s = np.zeros((batch_size, total_size))
+
             # Iterate over the batch
-            for k in range(DATA.size()[0]):
-                data, target = DATA[k].numpy(), TARGET[k].numpy() # Convert pytorch tensor to numpy array
-
-
+            for k in range(batch_size):
+                data, target = DATA[k].numpy(), TARGET[k].numpy()
 
                 ### FREE PHASE
-                # Create the BQM model for the free phase with the input data
                 h, J = createIsingProblem(net, args, data, simulated=args.simulated)
 
-
-                # Simulated annealing sampling
-                if args.simulated == 1: 
-
+                if args.simulated == 1:
                     model = dimod.BinaryQuadraticModel.from_ising(h, J, 0)
-                    oim_seq = sa_sampler.sample(model, num_reads = args.n_iter_free, num_sweeps = 100)
-
-                    # Print energies of the samples
-                    # energies = model.energies(oim_seq.record["sample"])
-                    # print(f"SA Energies: {sorted(energies.tolist())}")
-
-                    # Print samples with those energies
-                    # print(f"SA Samples: {oim_seq.record['sample']}")
-
-
-
-
-                # OIM sampling
-                else: # TODO readd
-
-                    # TODO speed up
-                    oim_seq = []
-                    oim_seq_energies = []
-
-                    for i in range(args.n_iter_free):
-                        # result = oim_problem_solver(-2*J, 20.0, 0.01, h=-h, oim_dynamics_function=simple_oim_dynamics) # TODO fiddle with duration and timestep and everything else
-                        result = oim_problem_solver(-2*J, 20.0, 0.01, h=-h, noise=True) 
-                        oim_seq.append(result[0])
-                        oim_seq_energies.append(result[1])
-
-                    oim_seq = [x for _, x in sorted(zip(oim_seq_energies, oim_seq), key=lambda pair: pair[0])]
-                    oim_seq_energies = sorted(oim_seq_energies)
-
-                    # print(f"OIM Energies: {oim_seq_energies}")
-
-                    
-
-
-
-
-
-
-
-
-
-
-                ## Nudge phase: same system except bias for the output layer
-                h, J = createIsingProblem(net, args, data, beta = args.beta, target = target, simulated=args.simulated)                
-
-
-                # First sample
-                if args.simulated == 1:
-                    first_seq_sample = oim_seq.record["sample"][0]
-                else:
-                    first_seq_sample = oim_seq[0]
-
-
-
-
-                # TODO check this works for OIMs too
-                if args.simulated == 1 and np.array_equal(first_seq_sample.reshape(1,-1)[:,args.layersList[1]:][0], target): # oim_seq.record["sample"] is an array of 10 simple arrays for each sample from the 10 in the sampler, [0] is the first one
-                
-                    oim_s = oim_seq # i.e. set the nudged state to be the same as the free state in this case 
+                    sa_seq = sampler.sample(model, num_reads=args.n_iter_free, num_sweeps=100)
+                    best_seq_sample = sa_seq.first.sample
+                    best_seq_sample_to_store = np.array([best_seq_sample[i] for i in range(len(best_seq_sample))])
+                    del sa_seq, best_seq_sample  # Cleanup
 
                 else:
+                    if args.oim_dynamics == 0:
+                        dynamics = sampler.wang_oim_dynamics
+                        stochastic_dynamics = sampler.wang_oim_stochastic_dynamics
+                    elif args.oim_dynamics == 1:
+                        dynamics = sampler.simple_oim_dynamics
+                        stochastic_dynamics = sampler.simple_oim_stochastic_dynamics
 
-                    # Simulated reverse annealing
+                    best_seq_sample, _ = sampler.oim_parallel_problem_solver(
+                        -2*J, args.oim_duration, args.oim_dt, 
+                        h=-h, 
+                        noise=args.oim_noise==1,
+                        runs=args.n_iter_free,
+                        oim_dynamics_function=dynamics,
+                        oim_stochastic_dynamics_function=stochastic_dynamics,
+                        rounding=args.oim_rounding==1,
+                        simple_rounding_only=args.oim_simple_rounding_only==1
+                    )
+                    best_seq_sample_to_store = best_seq_sample
+                    del best_seq_sample  # Cleanup
+
+                ### NUDGE PHASE
+                h, J = createIsingProblem(net, args, data, beta=args.beta, target=target, simulated=args.simulated)
+
+                if np.array_equal(best_seq_sample_to_store.reshape(1,-1)[:,args.layersList[1]:][0], target):
+                    best_s_sample_to_store = best_seq_sample_to_store
+                else:
                     if args.simulated == 1:
-
                         model = dimod.BinaryQuadraticModel.from_ising(h, J, 0)
-                    
-                        # TODO can we make this use first_seq_sample instead of oim_seq.record["sample"][0]?
-                        oim_s = sa_sampler.sample(model, num_reads = args.n_iter_nudge, num_sweeps = 100, initial_states = oim_seq.first.sample, reverse = True, fraction_annealed = args.frac_anneal_nudge)
+                        sa_s = sampler.sample(
+                            model,
+                            num_reads=args.n_iter_nudge,
+                            num_sweeps=100,
+                            initial_states=best_seq_sample_to_store,
+                            reverse=True,
+                            fraction_annealed=args.frac_anneal_nudge
+                        )
+                        best_s_sample = sa_s.first.sample
+                        best_s_sample_to_store = np.array([best_s_sample[i] for i in range(len(best_s_sample))])
+                        del sa_s, best_s_sample  # Cleanup
 
-                        # print("SA Nudge Energies")
-                        # print(model.energies(oim_s.record["sample"]))
-
-                    # OIM reverse annealing
                     else:
-                        oim_s = []
-                        oim_s_energies = []
-
-                        for i in range(args.n_iter_nudge):
-                            # TODO currently we just re-run OIM as usual for the nudge phase, but maybe some sort of more minimal 'reverse annealing' could be done
-                            # TODO speed up
-                            # result = oim_problem_solver(-2*J, 20.0, 0.01, h=-h, oim_dynamics_function=simple_oim_dynamics, initial_spins=oim_seq[1]) # oim_seq[0] should be lowest energy # TODO fiddle with duration and timestep and everything else
-                            result = oim_problem_solver(-2*J, 20.0, 0.01, h=-h, noise=True, initial_spins=first_seq_sample) # oim_seq[0] should be lowest energy # TODO fiddle with duration and timestep and everything else
-                            oim_s.append(result[0])
-                            oim_s_energies.append(result[1])
-
-
-                        # Sort the samples and energies by increasing energy
-                        oim_s = [x for _, x in sorted(zip(oim_s_energies, oim_s), key=lambda pair: pair[0])]
-                        oim_s_energies = sorted(oim_s_energies)
-
-                        # print("OIM Nudge Energies")
-                        # print(oim_s_energies)
+                        if args.oim_dynamics == 0:
+                            dynamics = sampler.wang_oim_dynamics
+                            stochastic_dynamics = sampler.wang_oim_stochastic_dynamics
+                        elif args.oim_dynamics == 1:
+                            dynamics = sampler.simple_oim_dynamics
+                            stochastic_dynamics = sampler.simple_oim_stochastic_dynamics
                     
+                        best_s_sample, _ = sampler.oim_parallel_problem_solver(
+                            -2*J, args.oim_duration, args.oim_dt,
+                            h=-h,
+                            noise=args.oim_noise==1,
+                            initial_spins=best_seq_sample_to_store,
+                            runs=args.n_iter_nudge,
+                            oim_dynamics_function=dynamics,
+                            oim_stochastic_dynamics_function=stochastic_dynamics,
+                            rounding=args.oim_rounding==1,
+                            simple_rounding_only=args.oim_simple_rounding_only==1
+                        )
+                        best_s_sample_to_store = best_s_sample
+                        del best_s_sample  # Cleanup
 
+                # Store batch results
+                store_seq[k] = best_seq_sample_to_store
+                store_s[k] = best_s_sample_to_store
 
+                # Clean up iteration variables
+                del h, J, data, target
+                del best_seq_sample_to_store, best_s_sample_to_store
 
-                # First sample
-                if args.simulated == 1:
-                    first_s_sample = oim_s.record["sample"][0]
-                else:
-                    first_s_sample = oim_s[0]
-
-
-
-
-                # Store all the free and nudged states of all the samples of the batch
-                if store_seq is None:
-                    store_seq = first_seq_sample.reshape(1, first_seq_sample.shape[0]) #qpu_seq
-                    store_s = first_s_sample.reshape(1, first_s_sample.shape[0]) #qpu_s
-                else:
-                    store_seq = np.concatenate((store_seq, first_seq_sample.reshape(1, first_seq_sample.shape[0])),0)
-                    store_s = np.concatenate((store_s, first_s_sample.reshape(1, first_s_sample.shape[0])),0)
-
-
-
-
-                # Delete variables to free up memory
-                del oim_seq, oim_s
-                del data, target
-
-
-            # Separate into [hidden layer, output layer] for the free and nudged states for all samples of the batch
+            # Separate into [hidden layer, output layer] for the free and nudged states
             seq = [store_seq[:,:args.layersList[1]], store_seq[:,args.layersList[1]:]]
-            s   = [store_s[:,:args.layersList[1]], store_s[:,args.layersList[1]:]]
+            s = [store_s[:,:args.layersList[1]], store_s[:,args.layersList[1]:]]
 
-
-            ## Compute loss and error for combined all samples of the batch
             loss, pred = net.computeLossAcc(seq, TARGET, args)
-
-            # Add loss and error to the total for the training set
             total_pred += pred
             total_loss += loss
 
-
             net.updateParams(DATA, s, seq, args)
 
-            del seq, s
-            del loss, pred 
+            # Clean up batch variables
+            del seq, s, store_seq, store_s
+            del loss, pred
             del DATA, TARGET
+            
+            # Force garbage collection at end of batch
+            gc.collect()
 
     print(f"Total Loss: {total_loss} (Normalised: {total_loss/len(train_loader.dataset)})")
     print(f"Total Pred: {total_pred} (Normalised: {total_pred/len(train_loader.dataset)})")
@@ -713,9 +606,7 @@ def train(net, args, train_loader, sa_sampler):
 
 
 
-
-
-def test(net, args, test_loader, oim_sampler):
+def test(net, args, test_loader, sampler):
     '''
     function to test the network
     '''
@@ -728,28 +619,33 @@ def test(net, args, test_loader, oim_sampler):
 
             ## Free phase
             h, J = createIsingProblem(net, args, data, simulated=args.simulated)
+
+            # Simulated sampling
             if args.simulated == 1:
                     model = dimod.BinaryQuadraticModel.from_ising(h, J, 0)
+                    actual_seq = sampler.sample(model, num_reads = args.n_iter_free, num_sweeps = 100)
 
-            # Simulated annealing sampling
-            if args.simulated == 1:
-                actual_seq = oim_sampler.sample(model, num_reads = args.n_iter_free, num_sweeps = 100)
-
-            # QPU sampling
+            # OIM sampling
             else:
-                actual_seq = []
-                actual_seq_energies = []
+                if args.oim_dynamics == 0:
+                    dynamics = sampler.wang_oim_dynamics
+                    stochastic_dynamics = sampler.wang_oim_stochastic_dynamics
+                elif args.oim_dynamics == 1:
+                    dynamics = sampler.simple_oim_dynamics
+                    stochastic_dynamics = sampler.simple_oim_stochastic_dynamics
 
-                for i in range(args.n_iter_free):
-                    # result = oim_problem_solver(-2*J, 20.0, 0.1, h=-h, oim_dynamics_function=simple_oim_dynamics)
-                    result = oim_problem_solver(-2*J, 20.0, 0.1, h=-h, noise=True)
-                    actual_seq.append(result[0])
-                    actual_seq_energies.append(result[1])
-
+                # Use Julia's parallel OIM solver for free phase
+                actual_seq, _ = sampler.oim_parallel_problem_solver(
+                    -2*J, args.oim_duration, args.oim_dt, 
+                    h=-h, 
+                    noise=args.oim_noise==1,
+                    runs=args.n_iter_free,
+                    oim_dynamics_function=dynamics,
+                    oim_stochastic_dynamics_function=stochastic_dynamics,
+                    rounding=args.oim_rounding==1,
+                    simple_rounding_only=args.oim_simple_rounding_only==1
+                )
                 
-                # Sort the samples by increasing energy
-                actual_seq = [x for _, x in sorted(zip(actual_seq_energies, actual_seq), key=lambda pair: pair[0])]
-                actual_seq_energies = sorted(actual_seq_energies)
 
                 # print(f"OIM Energies: {actual_seq_energies}")
 
@@ -757,14 +653,14 @@ def test(net, args, test_loader, oim_sampler):
 
 
 
-            # First sample
+            # Reshaping
             if args.simulated == 1:
                 actual_seq = actual_seq.record["sample"][0].reshape(1, actual_seq.record["sample"][0].shape[0]) 
             else:
-                actual_seq = actual_seq[0].reshape(1, actual_seq[0].shape[0])
+                actual_seq = actual_seq.reshape(1, actual_seq.shape[0])
 
 
-            ## Compute loss and error for QPU sampling
+            ## Compute loss and error for 
             seq = [actual_seq[:, :args.layersList[1]], actual_seq[:, args.layersList[1]:]] # Again separate into [hidden layer, output layer]
 
             loss, pred = net.computeLossAcc(seq, target.reshape(1,target.shape[0]), args)
@@ -785,7 +681,132 @@ def test(net, args, test_loader, oim_sampler):
 
 
 
+########## BATCH FUNCTION FOR OIM JULIA ONLY ##########
 
+def train_oim_julia_batch_parallel(net, args, train_loader, OIMSimulations):
+    '''
+    function to train the network for 1 epoch using Julia's batch parallel OIM solver,
+    with memory optimization
+    '''
+    import gc  # Add garbage collector import
+    total_pred, total_loss = 0, 0
 
+    with torch.no_grad():
+        print("Training")
+        for idx, (DATA, TARGET) in enumerate(progressbars(train_loader, position=0, leave=True)):
+            # Force garbage collection at start of each batch
+            gc.collect()
+            
+            batch_size = DATA.size()[0]
+            total_size = args.layersList[1] + args.layersList[2]  # Hidden + output size
+            
+            ### FREE PHASE
+            # Pre-allocate batch data arrays
+            J_batch = []
+            h_batch = []
+            for k in range(batch_size):
+                h, J = createIsingProblem(net, args, DATA[k].numpy(), simulated=0)
+                J_batch.append(-2*J)
+                h_batch.append(-h)
+                del h, J  # Cleanup intermediates
+            
+            # Select dynamics functions
+            if args.oim_dynamics == 0:
+                dynamics = OIMSimulations.wang_oim_dynamics
+                stochastic_dynamics = OIMSimulations.wang_oim_stochastic_dynamics
+            elif args.oim_dynamics == 1:
+                dynamics = OIMSimulations.simple_oim_dynamics
+                stochastic_dynamics = OIMSimulations.simple_oim_stochastic_dynamics
+                
+            # Batch solve free phase
+            best_seq_configs, best_seq_energies = OIMSimulations.oim_batch_parallel_problem_solver(
+                J_batch, h_batch,
+                duration=args.oim_duration,
+                timestep=args.oim_dt,
+                noise=args.oim_noise==1,
+                runs=args.n_iter_free,
+                oim_dynamics_function=dynamics,
+                oim_stochastic_dynamics_function=stochastic_dynamics,
+                rounding=args.oim_rounding==1,
+                simple_rounding_only=args.oim_simple_rounding_only==1
+            )
+            
+            # Convert to list and cleanup
+            best_seq_samples = list(best_seq_configs)
+            del best_seq_configs, best_seq_energies, J_batch, h_batch
 
+            ### NUDGE PHASE
+            # Pre-allocate arrays for nudge phase
+            need_nudge = []
+            best_s_samples = [None] * batch_size  # Pre-allocate full result array
+            J_batch = []
+            h_batch = []
+            initial_spins = []
+            
+            # Determine which samples need nudging
+            for k in range(batch_size):
+                data, target = DATA[k].numpy(), TARGET[k].numpy()
+                if np.array_equal(best_seq_samples[k].reshape(1,-1)[:,args.layersList[1]:][0], target):
+                    best_s_samples[k] = best_seq_samples[k]
+                else:
+                    need_nudge.append(k)
+                    h, J = createIsingProblem(net, args, data, beta=args.beta, target=target, simulated=0)
+                    J_batch.append(-2*J)
+                    h_batch.append(-h)
+                    initial_spins.append(best_seq_samples[k])
+                    del h, J  # Cleanup
 
+            # Only run nudge phase if needed
+            if need_nudge:
+                # Batch solve nudge phase
+                best_s_configs, best_s_energies = OIMSimulations.oim_batch_parallel_problem_solver(
+                    J_batch, h_batch,
+                    initial_spins_batch=initial_spins,
+                    duration=args.oim_duration,
+                    timestep=args.oim_dt,
+                    noise=args.oim_noise==1,
+                    runs=args.n_iter_nudge,
+                    oim_dynamics_function=dynamics,
+                    oim_stochastic_dynamics_function=stochastic_dynamics,
+                    rounding=args.oim_rounding==1,
+                    simple_rounding_only=args.oim_simple_rounding_only==1
+                )
+                
+                # Insert nudged results back in correct positions
+                for idx, batch_idx in enumerate(need_nudge):
+                    best_s_samples[batch_idx] = best_s_configs[idx]
+                
+                # Cleanup
+                del best_s_configs, best_s_energies
+            
+            del J_batch, h_batch, initial_spins, need_nudge
+            
+            # Stack all results
+            store_seq = np.stack(best_seq_samples)
+            store_s = np.stack(best_s_samples)
+            del best_seq_samples, best_s_samples
+            
+            # Separate into [hidden layer, output layer]
+            seq = [store_seq[:,:args.layersList[1]], store_seq[:,args.layersList[1]:]]
+            s = [store_s[:,:args.layersList[1]], store_s[:,args.layersList[1]:]]
+            del store_seq, store_s
+
+            # Compute loss and accuracy
+            loss, pred = net.computeLossAcc(seq, TARGET, args)
+            total_pred += pred
+            total_loss += loss
+
+            # Update network parameters
+            net.updateParams(DATA, s, seq, args)
+
+            # Clean up all remaining batch variables
+            del seq, s
+            del loss, pred
+            del DATA, TARGET
+            
+            # Force garbage collection at end of batch
+            gc.collect()
+
+    print(f"Total Loss: {total_loss} (Normalised: {total_loss/len(train_loader.dataset)})")
+    print(f"Total Pred: {total_pred} (Normalised: {total_pred/len(train_loader.dataset)})")
+    return total_loss, total_pred

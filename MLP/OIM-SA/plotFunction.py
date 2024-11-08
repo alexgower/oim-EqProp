@@ -2,212 +2,232 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 import os
-import glob # To use UNIX shell style wildcards
 
+def get_max_epochs(data_list):
+    """Get the maximum number of epochs from non-empty data."""
+    return max(len(data) for data in data_list if len(data) > 0)
+
+def plot_individual_accuracies(store_single_train_error, store_single_test_error, folders):
+    """Plot all individual run accuracies on the same graph with distinct colors and fixed y-axis."""
+    plt.figure(figsize=(12, 6))
+    
+    # Use a combination of color maps to get more distinct colors
+    colors = []
+    colors.extend(plt.cm.Set1(np.linspace(0, 1, 9)))
+    colors.extend(plt.cm.Set2(np.linspace(0, 1, 8)))
+    colors.extend(plt.cm.Dark2(np.linspace(0, 1, 8)))
+    colors.extend(plt.cm.Paired(np.linspace(0, 1, 12)))
+    
+    # Plot each run up to its own maximum epoch
+    for idx, (train_acc, test_acc, folder) in enumerate(zip(store_single_train_error, store_single_test_error, folders)):
+        if len(train_acc) == 0 or len(test_acc) == 0:
+            print(f"Skipping empty data for folder {folder}")
+            continue
+            
+        epochs = np.arange(len(train_acc))
+        color = colors[idx % len(colors)]
+        
+        plt.plot(epochs, train_acc, '-', 
+                color=color, alpha=0.8, 
+                label=f'{folder} (train)')
+        plt.plot(epochs, test_acc, '--', 
+                color=color, alpha=0.5, 
+                label=f'{folder} (test)')
+    
+    plt.ylim(0, 100)  # Set y-axis limits to 0-100%
+    plt.ylabel('Accuracy (%)')
+    plt.xlabel('Epochs')
+    plt.title('Train and Test Accuracy for Individual Runs')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.savefig('individual_accuracies.png', bbox_inches='tight', dpi=300)
+    plt.close()
 
 def plot_accuracy(dataframe, idx, color):
-
+    if dataframe.empty:
+        return np.array([]), np.array([])
+        
     single_train_error_tab = np.array(dataframe['Train_Acc'].values.tolist())
     single_test_error_tab = np.array(dataframe['Test_Acc'].values.tolist())
 
-    plt.plot(single_train_error_tab, '-', color = color, alpha = 0.8, label = str(idx))
-    plt.plot(single_test_error_tab, '--', color = color, alpha = 0.5, label = str(idx))
+    epochs = np.arange(len(single_train_error_tab))
+    plt.figure()
+    plt.plot(epochs, single_train_error_tab, '-', color=color, alpha=0.8, label=str(idx))
+    plt.plot(epochs, single_test_error_tab, '--', color=color, alpha=0.5, label=str(idx))
 
+    plt.ylim(0, 100)  # Set y-axis limits to 0-100%
     plt.ylabel('Accuracy (%)')
     plt.xlabel('Epochs')
-
     plt.title('Train and Test Accuracy (averaged)')
     plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
 
-    # Save as error.png
     plt.savefig(f'{idx}/singleAcc.png')
-    plt.close()  # Close the figure to free up memory
-
+    plt.close()
 
     return single_train_error_tab, single_test_error_tab
 
-
-
-
-
-
 def plot_loss(dataframe, idx, color):
-
+    if dataframe.empty:
+        return np.array([]), np.array([])
+        
     single_train_loss_tab = np.array(dataframe['Train_Loss'].values.tolist())
     single_test_loss_tab = np.array(dataframe['Test_Loss'].values.tolist())
 
-    plt.plot(single_train_loss_tab, '-', color = color, alpha = 0.8, label = str(idx))
-    plt.plot(single_test_loss_tab, '--', color = color, alpha = 0.5, label = str(idx))
-
-    plt.ylabel('Loss (%)')
-    plt.xlabel('Epochs')
-
-    plt.title('Train and Test loss')
-    plt.legend()
-
-    # Save as loss.png
-    plt.savefig(f'{idx}/singleLoss.png')
-    plt.close()  # Close the figure to free up memory
-
-
-    return single_train_loss_tab, single_test_loss_tab
-
-
-
-
-
-
-# TODo remove unused arguments
-def plot_mean_error(store_ave_train_error, store_ave_test_error, store_single_train_error, store_single_test_error):
-    '''
-    Plot mean train & test error with +/- std
-    '''
-
-    # TODO check that we want this removed
-    # store_ave_train_error, store_ave_test_error = np.array(store_ave_train_error), np.array(store_ave_test_error)
-    # mean_ave_train, mean_ave_test = np.mean(store_ave_train_error, axis = 0), np.mean(store_ave_test_error, axis = 0)
-    # std_ave_train, std_ave_test = np.std(store_ave_train_error, axis = 0), np.std(store_ave_test_error, axis = 0)
-
-    store_single_train_error, store_single_test_error = np.array(store_single_train_error), np.array(store_single_test_error)
-    mean_single_train, mean_single_test = np.mean(store_single_train_error, axis = 0), np.mean(store_single_test_error, axis = 0)
-    std_single_train, std_single_test = np.std(store_single_train_error, axis = 0), np.std(store_single_test_error, axis = 0)
-
-    epochs = np.arange(0, len(store_single_test_error[0])) # = 0:1:len(store_ave_test_error[0])
-    max_epoch = 50
+    epochs = np.arange(len(single_train_loss_tab))
     plt.figure()
-
-
-    # TODO check that we want this removed
-    #plt.plot(epochs, mean_ave_train, label = 'mean_ave_train_accuracy')
-    #plt.fill_between(epochs, mean_ave_train[:39] - std_ave_train[:39], mean_ave_train[:39] + std_ave_train[:39], facecolor = '#b9f3f3')
-    #plt.plot(epochs, mean_ave_test, label = 'mean_ave_test_accuracy')
-    #plt.fill_between(epochs, mean_ave_test - std_ave_test, mean_ave_test + std_ave_test, facecolor = '#fadcb3')
-
-
-    # TODO see why no error bars are plotted
-    plt.plot(epochs[:max_epoch], mean_single_train[:max_epoch], '--', label = 'mean_single_train_accuracy')
-    plt.fill_between(epochs[:max_epoch], mean_single_train[:max_epoch] - std_single_train[:max_epoch], mean_single_train[:max_epoch] + std_single_train[:max_epoch], facecolor = '#b9f3f3')
-
-    plt.plot(epochs[:max_epoch], mean_single_test[:max_epoch], '--', label = 'mean_single_test_accuracy')
-    plt.fill_between(epochs[:max_epoch], mean_single_test[:max_epoch]- std_single_test[:max_epoch], mean_single_test[:max_epoch] + std_single_test[:max_epoch], facecolor = '#fadcb3')
-
-    plt.ylabel('Accuracy (%)')
-    plt.xlabel('Epochs')
-    plt.title('Mean train and Test Accuracy with std')
-    plt.legend()
-
-    # Save as mean_error.png
-    plt.savefig(f'meanAcc.png')
-    plt.close()  # Close the figure to free up memory
-
-
-    return  mean_single_train[-1], std_single_train[-1], mean_single_test[-1], std_single_test[-1]
-    
-
-
-
-
-
-
-
-def plot_mean_loss(store_train_loss, store_test_loss):
-    '''
-    Plot mean train & test loss with +/- std
-    '''
-
-    store_train_loss, store_test_loss = np.array(store_train_loss), np.array(store_test_loss)
-    mean_train, mean_test = np.mean(store_train_loss, axis = 0), np.mean(store_test_loss, axis = 0)
-    std_train, std_test = np.std(store_train_loss, axis = 0), np.std(store_test_loss, axis = 0)
-    
-    
-    epochs = np.arange(0, len(store_test_loss[0]))
-    
-    
-    plt.figure()
-    plt.plot(epochs, mean_train, label = 'mean_train_loss')
-    plt.fill_between(epochs, mean_train - std_train, mean_train + std_train, facecolor = '#b9f3f3')
-
-    plt.plot(epochs, mean_test, label = 'mean_test_loss')
-    plt.fill_between(epochs, mean_test - std_test, mean_test + std_test, facecolor = '#fadcb3')
+    plt.plot(epochs, single_train_loss_tab, '-', color=color, alpha=0.8, label=str(idx))
+    plt.plot(epochs, single_test_loss_tab, '--', color=color, alpha=0.5, label=str(idx))
 
     plt.ylabel('Loss')
     plt.xlabel('Epochs')
-    plt.title('Mean train and Test loss with std')
+    plt.title('Train and Test loss')
     plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
 
-    # Save as mean_loss.png
-    plt.savefig(f'meanLoss.png')
-    plt.close()  # Close the figure to free up memory
+    plt.savefig(f'{idx}/singleLoss.png')
+    plt.close()
 
+    return single_train_loss_tab, single_test_loss_tab
 
+def plot_mean_error(store_ave_train_error, store_ave_test_error, store_single_train_error, store_single_test_error):
+    # Filter out empty arrays
+    store_single_train_error = [arr for arr in store_single_train_error if len(arr) > 0]
+    store_single_test_error = [arr for arr in store_single_test_error if len(arr) > 0]
+    
+    if not store_single_train_error or not store_single_test_error:
+        print("No valid data for mean error plot")
+        return 0, 0, 0, 0
 
+    # Find the minimum length across all arrays
+    min_length = min(len(arr) for arr in store_single_train_error)
+    
+    # Truncate arrays to minimum length
+    store_single_train_error = [arr[:min_length] for arr in store_single_train_error]
+    store_single_test_error = [arr[:min_length] for arr in store_single_test_error]
+    
+    # Convert to numpy arrays for calculations
+    store_single_train_error = np.array(store_single_train_error)
+    store_single_test_error = np.array(store_single_test_error)
+    
+    mean_single_train = np.mean(store_single_train_error, axis=0)
+    mean_single_test = np.mean(store_single_test_error, axis=0)
+    std_single_train = np.std(store_single_train_error, axis=0)
+    std_single_test = np.std(store_single_test_error, axis=0)
 
+    epochs = np.arange(min_length)
+    plt.figure()
 
+    plt.plot(epochs, mean_single_train, '--', label='mean_single_train_accuracy')
+    plt.fill_between(epochs, mean_single_train - std_single_train, 
+                    mean_single_train + std_single_train, facecolor='#b9f3f3')
 
+    plt.plot(epochs, mean_single_test, '--', label='mean_single_test_accuracy')
+    plt.fill_between(epochs, mean_single_test - std_single_test, 
+                    mean_single_test + std_single_test, facecolor='#fadcb3')
 
+    plt.ylim(0, 100)  # Set y-axis limits to 0-100%
+    plt.ylabel('Accuracy (%)')
+    plt.xlabel('Epochs')
+    plt.title('Mean Train and Test Accuracy with std')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
 
+    plt.savefig('meanAcc.png')
+    plt.close()
 
+    return (mean_single_train[-1], std_single_train[-1], 
+            mean_single_test[-1], std_single_test[-1])
 
-# IF USING THIS SCRIPT AS A STANDALONE
+def plot_mean_loss(store_train_loss, store_test_loss):
+    # Filter out empty arrays
+    store_train_loss = [arr for arr in store_train_loss if len(arr) > 0]
+    store_test_loss = [arr for arr in store_test_loss if len(arr) > 0]
+    
+    if not store_train_loss or not store_test_loss:
+        print("No valid data for mean loss plot")
+        return
+    
+    # Find the minimum length across all arrays
+    min_length = min(len(arr) for arr in store_train_loss)
+    
+    # Truncate arrays to minimum length
+    store_train_loss = [arr[:min_length] for arr in store_train_loss]
+    store_test_loss = [arr[:min_length] for arr in store_test_loss]
+    
+    store_train_loss = np.array(store_train_loss)
+    store_test_loss = np.array(store_test_loss)
+    
+    mean_train = np.mean(store_train_loss, axis=0)
+    mean_test = np.mean(store_test_loss, axis=0)
+    std_train = np.std(store_train_loss, axis=0)
+    std_test = np.std(store_test_loss, axis=0)
+    
+    epochs = np.arange(min_length)
+    
+    plt.figure()
+    plt.plot(epochs, mean_train, label='mean_train_loss')
+    plt.fill_between(epochs, mean_train - std_train, mean_train + std_train, 
+                    facecolor='#b9f3f3')
+
+    plt.plot(epochs, mean_test, label='mean_test_loss')
+    plt.fill_between(epochs, mean_test - std_test, mean_test + std_test, 
+                    facecolor='#fadcb3')
+
+    plt.ylabel('Loss')
+    plt.xlabel('Epochs')
+    plt.title('Mean Train and Test Loss with std')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.7)
+
+    plt.savefig('meanLoss.png')
+    plt.close()
+
 if __name__ == '__main__':
-
-    path = os.getcwd()
-    prefix = '/'
-
-    files = glob.glob('*')
-
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(script_dir)
+    
     store_ave_train_error, store_single_train_error, store_train_loss = [], [], []
     store_ave_test_error, store_single_test_error, store_test_loss = [], [], []
 
-
     colormap = plt.cm.RdPu
-    colors = [colormap(i) for i in np.linspace(0, 1, len(files)+5)]
-
-
-    # Only get data from correct folders (remove other files from files list)
-    print(files)
-    files_to_keep = []
-    for idx, simu in enumerate(files):
-        name, extension = os.path.splitext(simu)
-        if extension not in ['.py', '.png']:
-            files_to_keep.append(simu)
-    files = files_to_keep
-    print(files)
-    files = sorted(files, key=lambda x: (int(x.split('-')[-1])))
-    print(files)
-
-
-
-
-    plt.figure()
-    for idx, simu in enumerate(files):
-        name, extension = os.path.splitext(simu)
-        if not extension == '.py' and not extension == '.png':
-            # Read results.csv file as dataframe
-            DATAFRAME = pd.read_csv(path + prefix + simu + prefix + 'results.csv', sep = ',', index_col = 0)
-
+    
+    # Look for all folders in the current directory
+    folders = [f for f in os.listdir(script_dir) 
+              if os.path.isdir(f) and os.path.exists(os.path.join(f, 'results.csv'))]
+    # Sort folders alphabetically
+    folders.sort()
+    
+    colors = [colormap(i) for i in np.linspace(0, 1, len(folders)+5)]
+    
+    print("Found folders:", folders)
+    
+    for idx, folder in enumerate(folders):
+        results_path = os.path.join(script_dir, folder, 'results.csv')
+        
+        if os.path.exists(results_path):
+            DATAFRAME = pd.read_csv(results_path, sep=',', index_col=0)
             
-            # PLOT ERROR
-            single_train_error_tab, single_test_error_tab = plot_accuracy(DATAFRAME, name, color = colors[-(idx+1)])
+            single_train_error_tab, single_test_error_tab = plot_accuracy(DATAFRAME, folder, color=colors[-(idx+1)])
             store_single_train_error.append(single_train_error_tab)
             store_single_test_error.append(single_test_error_tab)
-
-
-            # PLOT LOSS
-            train_loss_tab, test_loss_tab = plot_loss(DATAFRAME, name, color = colors[-(idx+1)])
+            
+            train_loss_tab, test_loss_tab = plot_loss(DATAFRAME, folder, color=colors[-(idx+1)])
             store_train_loss.append(train_loss_tab)
             store_test_loss.append(test_loss_tab)
-
         else:
-            pass
+            print(f"Warning: results.csv not found in folder {folder}")
 
-
-        
-
-    mean_ave_train, std_ave_train, mean_ave_test, std_ave_test = plot_mean_error(store_ave_train_error, store_ave_test_error, store_single_train_error, store_single_test_error)
+    # Plot individual accuracies
+    plot_individual_accuracies(store_single_train_error, store_single_test_error, folders)
+    
+    # Plot mean error and loss
+    mean_ave_train, std_ave_train, mean_ave_test, std_ave_test = plot_mean_error(
+        store_ave_train_error, store_ave_test_error, 
+        store_single_train_error, store_single_test_error
+    )
     plot_mean_loss(store_train_loss, store_test_loss)
 
-
-    print("Avg train acc = " +str(mean_ave_train) + " ± " + str(std_ave_train) + " std")
-    print("Avg test acc = " +str(mean_ave_test) + " ± " + str(std_ave_test) + " std")
-
+    print("Avg train acc = " + str(mean_ave_train) + " ± " + str(std_ave_train) + " std")
+    print("Avg test acc = " + str(mean_ave_test) + " ± " + str(std_ave_test) + " std")

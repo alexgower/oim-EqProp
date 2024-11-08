@@ -49,7 +49,7 @@ class Network(nn.Module):
             #sanity check
             assert seq[1].shape == target.shape
 
-            # Compute loss # TODO think if we need to change this for continuous loss function
+            # Compute loss # TODO LATER think if we need to change this for continuous loss function
         
             loss = (((target-seq[1])**2).sum()/2).item()
 
@@ -77,7 +77,7 @@ class Network(nn.Module):
         # seq = free output
 
         with torch.no_grad():
-            coef = args.beta*args.batch_size # TODO why are we multiplying by batch_size?
+            coef = args.beta*args.batch_size # Note we must divide by the batch size to get the average gradient over the batch
             
             gradsW, gradsB = [], []
 
@@ -91,7 +91,8 @@ class Network(nn.Module):
             # Compute gradients for biases in hidden layer
             gradsB.append(-(s[0] - seq[0]).sum(0) /coef)
 
-            # TODO figure out why we use .sum(0) for biases but not weights
+            # Note that we sum over the batch dimension to get the average gradient over the batch
+            # This is done automatically in the matrix multiplication for the weights but not for the biases hence the .sum(0) for biases
 
             return gradsW, gradsB
 
@@ -109,25 +110,25 @@ class Network(nn.Module):
 
 
             # Update weights and biases with their individual learning rates
-            # Clip them to be between -1 and 1 # TODO see what happens if we change this
+            # Clip them to be between -J_clip and J_clip
 
             #weights
             assert self.weights_1.shape == gradsW[0].shape
             self.weights_1 += args.lrW0 * gradsW[0]
-            self.weights_1 = self.weights_1.clip(-1,1)
+            self.weights_1 = self.weights_1.clip(-args.J_clip,args.J_clip)
 
             assert self.weights_0.shape == gradsW[1].shape
             self.weights_0 += args.lrW1 * gradsW[1]
-            self.weights_0 = self.weights_0.clip(-1,1)
+            self.weights_0 = self.weights_0.clip(-args.J_clip,args.J_clip)
 
             #biases
             assert self.bias_1.shape == gradsB[0].shape
             self.bias_1 += args.lrB0 * gradsB[0]
-            self.bias_1 = self.bias_1.clip(-1,1)
+            self.bias_1 = self.bias_1.clip(-args.J_clip,args.J_clip)
 
             assert self.bias_0.shape == gradsB[1].shape
             self.bias_0 += args.lrB1 * gradsB[1]
-            self.bias_0 = self.bias_0.clip(-1,1)
+            self.bias_0 = self.bias_0.clip(-args.J_clip,args.J_clip)
 
             del gradsW, gradsB
 
