@@ -109,7 +109,7 @@ def initDataframe(path, dataframe_to_init = 'results.csv'):
 def updateDataframe(BASE_PATH, dataframe, train_acc, test_acc, train_loss, test_loss):
     prefix = '/'
 
-    data = [train_acc, test_acc, train_loss[-1], test_loss[-1]]
+    data = [train_acc, test_acc, train_loss, test_loss]
 
     # Get the next epoch number
     next_epoch = len(dataframe) + 1
@@ -501,16 +501,9 @@ def train(net, args, train_loader, sampler):
                 data, target = DATA[k].numpy(), TARGET[k].numpy()
 
                 ### FREE PHASE
-                h, J = createIsingProblem(net, args, data, simulated=args.simulated)
+                h, J = createIsingProblem(net, args, data, simulation_type=args.simulation_type)
 
-                if args.simulated == 1:
-                    model = dimod.BinaryQuadraticModel.from_ising(h, J, 0)
-                    sa_seq = sampler.sample(model, num_reads=args.n_iter_free, num_sweeps=100)
-                    best_seq_sample = sa_seq.first.sample
-                    best_seq_sample_to_store = np.array([best_seq_sample[i] for i in range(len(best_seq_sample))])
-                    del sa_seq, best_seq_sample  # Cleanup
-
-                else:
+                if args.simulation_type == 0: # OIM annealing
                     if args.oim_dynamics == 0:
                         dynamics = sampler.wang_oim_dynamics
                         stochastic_dynamics = sampler.wang_oim_stochastic_dynamics
@@ -525,33 +518,34 @@ def train(net, args, train_loader, sampler):
                         runs=args.n_iter_free,
                         oim_dynamics_function=dynamics,
                         oim_stochastic_dynamics_function=stochastic_dynamics,
-                        rounding=args.oim_rounding==1,
+                        rounding=args.rounding==1,
                         simple_rounding_only=args.oim_simple_rounding_only==1
                     )
                     best_seq_sample_to_store = best_seq_sample
                     del best_seq_sample  # Cleanup
 
+                elif args.simulation_type== 1: # Simulated annealing
+                    model = dimod.BinaryQuadraticModel.from_ising(h, J, 0)
+                    sa_seq = sampler.sample(model, num_reads=args.n_iter_free, num_sweeps=100)
+                    best_seq_sample = sa_seq.first.sample
+                    best_seq_sample_to_store = np.array([best_seq_sample[i] for i in range(len(best_seq_sample))])
+                    del sa_seq, best_seq_sample  # Cleanup
+
+                elif args.simulation_type == 2: # Scellier annealing
+                    # TODO stuff here
+                    print("Scellier annealing not implemented yet")
+                else: 
+                    print("Invalid simulation type")
+                    raise ValueError("Invalid simulation type")
+                    
+
                 ### NUDGE PHASE
-                h, J = createIsingProblem(net, args, data, beta=args.beta, target=target, simulated=args.simulated)
+                h, J = createIsingProblem(net, args, data, beta=args.beta, target=target, simulation_type=args.simulation_type)
 
                 if np.array_equal(best_seq_sample_to_store.reshape(1,-1)[:,args.layersList[1]:][0], target):
                     best_s_sample_to_store = best_seq_sample_to_store
                 else:
-                    if args.simulated == 1:
-                        model = dimod.BinaryQuadraticModel.from_ising(h, J, 0)
-                        sa_s = sampler.sample(
-                            model,
-                            num_reads=args.n_iter_nudge,
-                            num_sweeps=100,
-                            initial_states=best_seq_sample_to_store,
-                            reverse=True,
-                            fraction_annealed=args.frac_anneal_nudge
-                        )
-                        best_s_sample = sa_s.first.sample
-                        best_s_sample_to_store = np.array([best_s_sample[i] for i in range(len(best_s_sample))])
-                        del sa_s, best_s_sample  # Cleanup
-
-                    else:
+                    if args.simulation_type == 0: # OIM annealing
                         if args.oim_dynamics == 0:
                             dynamics = sampler.wang_oim_dynamics
                             stochastic_dynamics = sampler.wang_oim_stochastic_dynamics
@@ -567,11 +561,34 @@ def train(net, args, train_loader, sampler):
                             runs=args.n_iter_nudge,
                             oim_dynamics_function=dynamics,
                             oim_stochastic_dynamics_function=stochastic_dynamics,
-                            rounding=args.oim_rounding==1,
+                            rounding=args.rounding==1,
                             simple_rounding_only=args.oim_simple_rounding_only==1
                         )
                         best_s_sample_to_store = best_s_sample
                         del best_s_sample  # Cleanup
+
+                    elif args.simulation_type == 1: # Simulated annealing
+                        model = dimod.BinaryQuadraticModel.from_ising(h, J, 0)
+                        sa_s = sampler.sample(
+                            model,
+                            num_reads=args.n_iter_nudge,
+                            num_sweeps=100,
+                            initial_states=best_seq_sample_to_store,
+                            reverse=True,
+                            fraction_annealed=args.frac_anneal_nudge
+                        )
+                        best_s_sample = sa_s.first.sample
+                        best_s_sample_to_store = np.array([best_s_sample[i] for i in range(len(best_s_sample))])
+                        del sa_s, best_s_sample  # Cleanup
+
+                    elif args.simulation_type == 2: # Scellier annealing
+                        # TODO stuff here
+                        print("Scellier annealing not implemented yet")
+                    
+                    else:
+                        print("Invalid simulation type")
+                        raise ValueError("Invalid simulation type")
+                        
 
                 # Store batch results
                 store_seq[k] = best_seq_sample_to_store
@@ -618,15 +635,10 @@ def test(net, args, test_loader, sampler):
             data, target = data.numpy()[0], target.numpy()[0]
 
             ## Free phase
-            h, J = createIsingProblem(net, args, data, simulated=args.simulated)
+            h, J = createIsingProblem(net, args, data, simulation_type=args.simulation_type)
 
             # Simulated sampling
-            if args.simulated == 1:
-                    model = dimod.BinaryQuadraticModel.from_ising(h, J, 0)
-                    actual_seq = sampler.sample(model, num_reads = args.n_iter_free, num_sweeps = 100)
-
-            # OIM sampling
-            else:
+            if args.simulation_type == 0: # OIM annealing
                 if args.oim_dynamics == 0:
                     dynamics = sampler.wang_oim_dynamics
                     stochastic_dynamics = sampler.wang_oim_stochastic_dynamics
@@ -642,22 +654,32 @@ def test(net, args, test_loader, sampler):
                     runs=args.n_iter_free,
                     oim_dynamics_function=dynamics,
                     oim_stochastic_dynamics_function=stochastic_dynamics,
-                    rounding=args.oim_rounding==1,
+                    rounding=args.rounding==1,
                     simple_rounding_only=args.oim_simple_rounding_only==1
                 )
-                
 
-                # print(f"OIM Energies: {actual_seq_energies}")
-
-            
-
-
-
-            # Reshaping
-            if args.simulated == 1:
-                actual_seq = actual_seq.record["sample"][0].reshape(1, actual_seq.record["sample"][0].shape[0]) 
-            else:
+                # Reshaping
                 actual_seq = actual_seq.reshape(1, actual_seq.shape[0])
+
+
+            elif args.simulation_type == 1:
+                    model = dimod.BinaryQuadraticModel.from_ising(h, J, 0)
+                    actual_seq = sampler.sample(model, num_reads = args.n_iter_free, num_sweeps = 100)
+
+                    # Reshaping
+                    actual_seq = actual_seq.record["sample"][0].reshape(1, actual_seq.record["sample"][0].shape[0]) 
+
+
+            elif args.simulation_type == 2: # Scellier annealing
+                # TODO stuff here
+                print("Scellier annealing not implemented yet")
+
+            else:
+                print("Invalid simulation type")
+                raise ValueError("Invalid simulation type")
+                
+                
+            
 
 
             ## Compute loss and error for 
@@ -693,6 +715,7 @@ def train_oim_julia_batch_parallel(net, args, train_loader, OIMSimulations):
 
     with torch.no_grad():
         print("Training")
+        
         for idx, (DATA, TARGET) in enumerate(progressbars(train_loader, position=0, leave=True)):
             # Force garbage collection at start of each batch
             gc.collect()
@@ -727,10 +750,31 @@ def train_oim_julia_batch_parallel(net, args, train_loader, OIMSimulations):
                 runs=args.n_iter_free,
                 oim_dynamics_function=dynamics,
                 oim_stochastic_dynamics_function=stochastic_dynamics,
-                rounding=args.oim_rounding==1,
+                rounding=args.rounding==1,
                 simple_rounding_only=args.oim_simple_rounding_only==1
             )
-            
+
+            if args.comparison==1:
+                # If comprison, first print the best sequence configurations and energies
+                print(f"Best sequence configurations: {best_seq_configs}")
+                print(f"Best sequence energies: {best_seq_energies}")
+
+                # Then also run another free phase (this will be hardcoded in))
+                best_seq_configs, best_seq_energies = OIMSimulations.oim_batch_parallel_problem_solver(
+                    J_batch, h_batch,
+                    duration=args.oim_duration,
+                    timestep=args.oim_dt,
+                    noise=args.oim_noise==1,
+                    runs=args.n_iter_free,
+                    oim_dynamics_function=dynamics,
+                    oim_stochastic_dynamics_function=stochastic_dynamics,
+                    rounding=0==1,
+                )
+
+                # Print the best sequence configurations and energies
+                print(f"Comparison sequence configurations: {best_seq_configs}")
+                print(f"Comparison sequence energies: {best_seq_energies}")
+                
             # Convert to list and cleanup
             best_seq_samples = list(best_seq_configs)
             del best_seq_configs, best_seq_energies, J_batch, h_batch
@@ -768,7 +812,7 @@ def train_oim_julia_batch_parallel(net, args, train_loader, OIMSimulations):
                     runs=args.n_iter_nudge,
                     oim_dynamics_function=dynamics,
                     oim_stochastic_dynamics_function=stochastic_dynamics,
-                    rounding=args.oim_rounding==1,
+                    rounding=args.rounding==1,
                     simple_rounding_only=args.oim_simple_rounding_only==1
                 )
                 

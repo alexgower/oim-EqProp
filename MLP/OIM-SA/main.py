@@ -18,51 +18,53 @@ from simulated_sampler import SimulatedAnnealingSampler
 
 import torch
 
+import psutil
+from julia.api import Julia
+from julia import Main, Distributed
+import gc
 
 
+
+
+def log_memory_usage():
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    print(f"Memory usage: {memory_info.rss / 1024 / 1024:.2f} MB")
+    print(f"Virtual Memory: {memory_info.vms / 1024 / 1024:.2f} MB")
+    print(f"Percent: {process.memory_percent():.1f}%")
+
+def should_reset_workers():
+   """Check if memory usage is too high and workers need reset"""
+   process = psutil.Process()
+   memory_percent = process.memory_percent()
+   print(f"Current memory usage: {memory_percent:.1f}%")
+   return memory_percent > 70  # Reset if using >70% of available RAM
+
+def reset_julia_workers(n_workers):
+   """Reset Julia workers during runtime"""
+   print("Memory threshold exceeded - resetting workers...")
+   try:
+       Distributed.rmprocs(Distributed.workers())
+       Main.GC.gc()
+       setup_julia_workers(n_workers)
+       print("Worker reset complete")
+   except Exception as e:
+       print(f"Error resetting workers: {e}")
 
 def cleanup_julia_workers():
     """Cleanup Julia workers on program exit"""
     try:
-        from julia import Distributed
         Distributed.rmprocs(Distributed.workers())
+        Main.GC.gc()
     except:
         pass
 
-def setup_julia(n_workers=40):
-    """Setup Julia environment and OIM modules with optimizations"""
-    print("Initializing Julia...")
-    
-    # Set environment vamoduoriables before importing Julia
-    os.environ["PYTHON"] = ""  # Avoid conda python conflicts
-    
-    # Create local Julia depot path in the current working directory
-    local_depot = os.path.join(os.getcwd(), ".julia_depot")
-    if not os.path.exists(local_depot):
-        os.makedirs(local_depot)
-    os.environ["JULIA_DEPOT_PATH"] = f"{local_depot}:{os.environ.get('JULIA_DEPOT_PATH', '')}"
-    
-    # Register cleanup function
-    atexit.register(cleanup_julia_workers)
-    
-    # Initialize Julia with custom system image if available
-    from julia.api import Julia
-    sysimage_path = Path("oim_custom.so")
-    if sysimage_path.exists():
-        print("Using custom system image...")
-        jl = Julia(compiled_modules=True,
-                  sysimage=str(sysimage_path))
-    else:
-        print("No custom system image found, using default...")
-        jl = Julia(compiled_modules=True)  # Removed runtime_config parameter
-    
-    from julia import Main, Distributed
-    
+def setup_julia_workers(n_workers):
+    """Setup Julia workers and load necessary modules"""
     print(f"Adding {n_workers} workers...")
     Distributed.addprocs(n_workers)
 
     print("Activating environment on workers...")
-    # Combine commands to reduce communication overhead
     Main.eval('''
         using Distributed;
         @everywhere begin
@@ -76,7 +78,6 @@ def setup_julia(n_workers=40):
     module_path = os.path.join("..", "oim-simulator", "code", "core", "simulations", "oim_simulations.jl")
     abs_module_path = os.path.abspath(module_path)
     
-    # Load and precompile module on all workers at once
     Main.eval(f'''
         include("{abs_module_path}");
         @everywhere include("{abs_module_path}");
@@ -84,19 +85,54 @@ def setup_julia(n_workers=40):
         @everywhere using .OIMSimulations;
     ''')
 
+def setup_julia(n_workers=40):
+    """Initial Julia setup and environment configuration"""
+    print("Initializing Julia...")
+    
+    # Set environment variables before importing Julia
+    os.environ["PYTHON"] = ""  # Avoid conda python conflicts
+    
+    # Create local Julia depot path in the current working directory
+    local_depot = os.path.join(os.getcwd(), ".julia_depot")
+    if not os.path.exists(local_depot):
+        os.makedirs(local_depot)
+    os.environ["JULIA_DEPOT_PATH"] = f"{local_depot}:{os.environ.get('JULIA_DEPOT_PATH', '')}"
+    
+    # Register cleanup function
+    atexit.register(cleanup_julia_workers)
+    
+    # Initialize Julia with custom system image if available
+    sysimage_path = Path("oim_custom.so")
+    if sysimage_path.exists():
+        print("Using custom system image...")
+        jl = Julia(compiled_modules=True,
+                  sysimage=str(sysimage_path))
+    else:
+        print("No custom system image found, using default...")
+        jl = Julia(compiled_modules=True)
+
+    # Setup workers and load modules
+    setup_julia_workers(n_workers)
+    
     print("Julia setup complete!")
     return Main.OIMSimulations
-
 
 
 # Parse arguments from command line
 parser = argparse.ArgumentParser(description='Binary Equilibrium Propagation with D-Wave support')\
 
 parser.add_argument(
-    '--simulated',
+    '--comparison', 
     type=int,
     default=0,
-    help='specify if we use simulated annealing (=1) or OIM annealing (=0) (default=1, else = 0)') # TODO LATER implement our own SA too?
+    help='Comparison with hardcoded alternative annealing (default=0)')
+parser.add_argument(
+    '--simulation_type',
+    type=int,
+    default=0,
+    help='specify if we use OIM annealing (=0) or simulated annealing (=1) or scellier dynamics (2) (default=0)') # TODO LATER implement our own SA too?
+
+
 parser.add_argument(
     '--oim_duration',
     type=float,
@@ -118,15 +154,27 @@ parser.add_argument(
     default=0,
     help='OIM Dynamics (Wang = 0, Simple = 1)')
 parser.add_argument(
-    '--oim_rounding',
+    '--rounding',
     type=int,
-    default=1,
+    default=0,
     help='OIM Rounding to Ising spins (1) or keeping as soft cos(\phi_i) continuous variables (0) after anneal (default=1)')
 parser.add_argument(
     '--oim_simple_rounding_only',
     type=int,
-    default=1,
+    default=0,
     help='OIM Simple Rounding Only (default=0)')
+parser.add_argument(
+    '--N_data_train',
+    type=int,
+    default=1000, #60000 max
+    # default=10000,
+    help='Number of data points for training (default=1000)') 
+parser.add_argument(
+    '--N_data_test',
+    type=int,
+    default=100, #10000 max
+    # default=1000,
+    help='Number of data points for testing (default=100)')
 
 parser.add_argument(
     '--epochs',
@@ -138,7 +186,9 @@ parser.add_argument(
     nargs='+',
     type=int,
     # default=[784, 10, 10],
-    default=[784, 120, 40],
+    # default=[784, 120, 40],
+    default=[784, 120, 10],
+    # default=[784, 500, 40],
     help='List of layer sizes (default: [784, 120, 10])') # TODO NEXT try 10 with continuous
 parser.add_argument(
     '--batch_size',
@@ -158,12 +208,14 @@ parser.add_argument(
 parser.add_argument( # TODO LATER think about this clipping
     '--h_clip',
     type=float,
-    default=1.0,
+    default=1.0, # Laydevant did 1.0
+    # default=10.0, 
     help='Max limit for the amplitude of the local h applied to the oscillators, either for free or nudge phase - (default=1)')
 parser.add_argument( # TODO LATER think about this clipping
     '--J_clip',
     type=float,
-    default=1.0,
+    default=1.0, # Laydevant did 1.0
+    # default=10.0,
     help='Max limit for the amplitude of the local J applied to the oscillators, either for free or nudge phase - (default=1)')
 
 parser.add_argument(
@@ -188,15 +240,10 @@ parser.add_argument(
     default=10, 
     help='Times to iterate for the OIM on a single data point for getting the minimal energy state of the nudge phase (default=10)')
 parser.add_argument(
-    '--N_data_train',
+    '--load_model',
     type=int,
-    default=1000,
-    help='Number of data points for training (default=1000)') 
-parser.add_argument(
-    '--N_data_test',
-    type=int,
-    default=100, 
-    help='Number of data points for testing (default=100)')
+    default=0,
+    help='If we load the parameters from a previously trained model to continue the training (default=0, else = 1)')
 
 
 parser.add_argument(
@@ -229,11 +276,6 @@ parser.add_argument(
     type=float,
     default=0.001,
     help='Learning rate for biases - output (default=0.001)')
-parser.add_argument(
-    '--load_model',
-    type=int,
-    default=0,
-    help='If we load the parameters from a previously trained model to continue the training (default=0, else = 1)')
 parser.add_argument(
     '--gain_weight0',
     type=float,
@@ -288,11 +330,20 @@ with torch.no_grad():
 
 
     ## Monitor loss and prediction error
-    train_loss_tab, train_error_tab = [], []
-    test_loss_tab, test_error_tab = [], []
+    train_loss_tab = np.zeros(args.epochs)
+    train_error_tab = np.zeros(args.epochs)
+    test_loss_tab = np.zeros(args.epochs)
+    test_error_tab = np.zeros(args.epochs)
 
     for epoch in progressbars(range(args.epochs)):
         print(f"Epoch {epoch+1}/{args.epochs}")
+        log_memory_usage()
+
+        if epoch > 0 and should_reset_workers():  # Skip first epoch check
+            reset_julia_workers(args.procs)
+            gc.collect()  # Force Python garbage collection after reset
+            OIMSimulations = Main.OIMSimulations  # Re-establish OIMSimulations after reset
+
 
         # Train the network
         # loss, error = train(net, args, train_loader, sampler)
@@ -300,19 +351,19 @@ with torch.no_grad():
             loss, error = train(net, args, train_loader, SimulatedAnnealingSampler())
         else:
             loss, error = train_oim_julia_batch_parallel(net, args, train_loader, OIMSimulations)
-        train_loss_tab.append(loss)
-        train_error_tab.append(error)
+        train_loss_tab[epoch] = loss
+        train_error_tab[epoch] = error
 
         # Test the network
         if args.simulated == 1:
             loss, error = test(net, args, test_loader, SimulatedAnnealingSampler())
         else:
             loss, error = test(net, args, test_loader, OIMSimulations)
-        test_loss_tab.append(loss)
-        test_error_tab.append(error)
+        test_loss_tab[epoch] = loss
+        test_error_tab[epoch] = error
 
         # Store error and loss at each epoch
-        dataframe = updateDataframe(BASE_PATH, dataframe, np.array(train_error_tab)[-1]/len(train_loader.dataset)*100, np.array(test_error_tab)[-1]/len(test_loader.dataset)*100, train_loss_tab, test_loss_tab)
+        dataframe = updateDataframe(BASE_PATH, dataframe, np.array(train_error_tab)[epoch]/len(train_loader.dataset)*100, np.array(test_error_tab)[epoch]/len(test_loader.dataset)*100, train_loss_tab[epoch], test_loss_tab[epoch])
 
         save_model_numpy(BASE_PATH, net)
 
