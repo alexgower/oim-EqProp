@@ -1,371 +1,192 @@
-import matplotlib.pyplot as plt
-import numpy as np
-import argparse # For parsing arguments from command line
-from math import*
-from tqdm import tqdm as progressbars # For progress bar
-import os # For file management
-from random import*
-import atexit
-from pathlib import Path
-
-from Tools import*
-from Network import*
-
-
-# Used to compare to Laydevant D-Wave based Simulated Annealing
-from simulated_sampler import SimulatedAnnealingSampler 
-
-
-import torch
-
-import psutil
-from julia.api import Julia
-from julia import Main, Distributed
+print("Starting imports...")  # Add at very top of file
+import os
 import gc
+import numpy as np
+print("Basic imports done")
+print("Importing torch...")
+import torch
+print("Torch imported")
+import argparse
+print("Importing wandb...")
+import wandb
+print("Wandb imported")
+from tqdm import tqdm as progressbars
+
+print("Importing local modules...")
+print("Importing train_test...")
+from train_test import train, test
+print("Importing dataset_generation_tools...")
+from tools.dataset_generation_tools import generate_mnist
+print("Importing project_tools...")
+from tools.project_tools import createPath, initDataframe, updateDataframe, save_model_numpy, load_model_numpy, saveHyperparameters
+print("Importing Network...")
+from Network import Network
+print("All imports completed")
+
+def print_network_stats(net, args):
+    """Print network statistics in a clean format."""
+    print("\nNetwork Statistics:")
+    print(f"Weights (max abs) - Input->Hidden: {np.max(np.abs(net.weights_0)):.4f}, Hidden->Output: {np.max(np.abs(net.weights_1)):.4f} (clip: {args.J_clip})")
+    print(f"Biases (max abs) - Hidden: {np.max(np.abs(net.bias_0)):.4f}, Output: {np.max(np.abs(net.bias_1)):.4f} (clip: {args.h_clip})")
+    print(f"Syncs (max abs) - Hidden: {np.max(np.abs(net.sync_0)):.4f}, Output: {np.max(np.abs(net.sync_1)):.4f} (clip: {args.sync_clip})")
 
 
-
-
-def log_memory_usage():
-    process = psutil.Process()
-    memory_info = process.memory_info()
-    print(f"Memory usage: {memory_info.rss / 1024 / 1024:.2f} MB")
-    print(f"Virtual Memory: {memory_info.vms / 1024 / 1024:.2f} MB")
-    print(f"Percent: {process.memory_percent():.1f}%")
-
-def should_reset_workers():
-   """Check if memory usage is too high and workers need reset"""
-   process = psutil.Process()
-   memory_percent = process.memory_percent()
-   print(f"Current memory usage: {memory_percent:.1f}%")
-   return memory_percent > 70  # Reset if using >70% of available RAM
-
-def reset_julia_workers(n_workers):
-   """Reset Julia workers during runtime"""
-   print("Memory threshold exceeded - resetting workers...")
-   try:
-       Distributed.rmprocs(Distributed.workers())
-       Main.GC.gc()
-       setup_julia_workers(n_workers)
-       print("Worker reset complete")
-   except Exception as e:
-       print(f"Error resetting workers: {e}")
-
-def cleanup_julia_workers():
-    """Cleanup Julia workers on program exit"""
-    try:
-        Distributed.rmprocs(Distributed.workers())
-        Main.GC.gc()
-    except:
-        pass
-
-def setup_julia_workers(n_workers):
-    """Setup Julia workers and load necessary modules"""
-    print(f"Adding {n_workers} workers...")
-    Distributed.addprocs(n_workers)
-
-    print("Activating environment on workers...")
-    Main.eval('''
-        using Distributed;
-        @everywhere begin
-            using Pkg;
-            Pkg.activate(".");
-            ENV["GKSwstype"] = "100";  # Disable plotting display
-        end
-    ''')
-
-    print("Loading OIM module...")
-    module_path = os.path.join("..", "oim-simulator", "code", "core", "simulations", "oim_simulations.jl")
-    abs_module_path = os.path.abspath(module_path)
+def main():
+    print("\nStarting main.py...")
     
-    Main.eval(f'''
-        include("{abs_module_path}");
-        @everywhere include("{abs_module_path}");
-        using .OIMSimulations;
-        @everywhere using .OIMSimulations;
-    ''')
+    # Parse arguments from command line
+    print("Setting up argument parser...")
+    parser = argparse.ArgumentParser(description='Continuous Equilibrium Propagation with OIM')
 
-def setup_julia(n_workers=40):
-    """Initial Julia setup and environment configuration"""
-    print("Initializing Julia...")
+    # Add wandb arguments
+    parser.add_argument('--wandb_project', type=str, default='oim-eq-prop', help='WandB project name')
+    parser.add_argument('--wandb_entity', type=str, default='alexgower-team', help='WandB entity/username')
+    parser.add_argument('--wandb_name', type=str, default=None, help='WandB run name')
+    parser.add_argument('--wandb_mode', type=str, default='online', help='WandB mode (online/offline/disabled)')
+
+    # Simulation parameters
+    parser.add_argument('--simulation_type', type=int, default=0, help='Type of simulation, 0=OIM, 1=SA (default=0)')
+    parser.add_argument('--rounding', type=int, default=0, help='Rounding type (default=0)') # TODO theres no rounding in this current codebase
+    parser.add_argument('--exact_grads', type=int, default=0, help='Exact gradients calculated using RBP instead of EP (default=0)')
+    parser.add_argument('--debug', type=int, default=0, help='Debug mode (default=0)')
+
+    # OIM dynamics parameters
+    parser.add_argument('--oim_duration', type=float, default=40.0, help='Duration of the OIM simulation (default=20.0)')
+    parser.add_argument('--oim_dt', type=float, default=0.2, help='Time step of the OIM simulation (default=0.1)')
+    parser.add_argument('--oim_noise', type=int, default=0, help='Noise in the OIM simulation (default=0)')
+    parser.add_argument('--oim_random_initialization', type=int, default=0, help='Random initialization of the OIM simulation as opposed to fixed pi/2 initialisation (default=1)')
+    parser.add_argument('--nudge_reinitialisation', type=int, default=0, help='Nudge phase uses reinitialised phases (not free steady state phases) in the OIM simulation (default=1)')
+    parser.add_argument('--n_procs', type=int, default=None, help='Number of processors for parallel processing (default=None)')
+
+    # Network parameters
+    parser.add_argument('--layersList', nargs='+', type=int, default=[784, 500, 10], help='List of layer sizes (default: [784, 120, 40])')
+    parser.add_argument('--batch_size', type=int, default=40, help='Size of mini-batches (default=4)')
+    parser.add_argument('--max_chunk_size', type=int, default=40, help='Size of chunks for parallel processing (default=20)')
+    parser.add_argument('--beta', type=float, default=0.5, help='Beta - hyperparameter of EP (default=1.0)') # TODO think
     
-    # Set environment variables before importing Julia
-    os.environ["PYTHON"] = ""  # Avoid conda python conflicts
+    # Clipping parameters
+    parser.add_argument('--h_clip', type=float, default=1.0, help='Max limit for local h (default=1)') # TODO think    
+    parser.add_argument('--J_clip', type=float, default=1.0, help='Max limit for local J (default=1)') # TODO think
+    parser.add_argument('--sync_clip', type=float, default=1.0, help='Max limit for sync terms (default=1)') # TODO think
+
+
+
+    # Training parameters
+    parser.add_argument('--epochs', type=int, default=50, help='Number of epochs (default=50)')
+    parser.add_argument('--lrW0', type=float, default=0.01, help='Learning rate for weights - input-hidden (default=0.01)') # TODO think
+    parser.add_argument('--lrW1', type=float, default=0.01, help='Learning rate for weights - hidden-output (default=0.01)') # TODO think
+    parser.add_argument('--lrB0', type=float, default=0.001, help='Learning rate for biases - hidden (default=0.001)')
+    parser.add_argument('--lrB1', type=float, default=0.001, help='Learning rate for biases - output (default=0.001)')
+    parser.add_argument('--lrSYNC0', type=float, default=0.001, help='Learning rate for syncs - input-hidden (default=0.001)')
+    parser.add_argument('--lrSYNC1', type=float, default=0.001, help='Learning rate for syncs - hidden-output (default=0.001)')
+    parser.add_argument('--gain_weight0', type=float, default=0.5, help='Gain for weights - input-hidden (default=0.5)')  # TODO think
+    parser.add_argument('--gain_weight1', type=float, default=0.25, help='Gain for weights - hidden-output (default=0.25)')  # TODO think
     
-    # Create local Julia depot path in the current working directory
-    local_depot = os.path.join(os.getcwd(), ".julia_depot")
-    if not os.path.exists(local_depot):
-        os.makedirs(local_depot)
-    os.environ["JULIA_DEPOT_PATH"] = f"{local_depot}:{os.environ.get('JULIA_DEPOT_PATH', '')}"
-    
-    # Register cleanup function
-    atexit.register(cleanup_julia_workers)
-    
-    # Initialize Julia with custom system image if available
-    sysimage_path = Path("oim_custom.so")
-    if sysimage_path.exists():
-        print("Using custom system image...")
-        jl = Julia(compiled_modules=True,
-                  sysimage=str(sysimage_path))
-    else:
-        print("No custom system image found, using default...")
-        jl = Julia(compiled_modules=True)
+    # Data parameters
+    parser.add_argument('--dataset', type=str, default='mnist', help='Dataset to use, mnist or digits (default=mnist)')
+    parser.add_argument('--N_data_train', type=int, default=60000, help='Number of data points for training (default=10000)') 
+    parser.add_argument('--N_data_test', type=int, default=10000, help='Number of data points for testing (default=1000)')
+    parser.add_argument('--data_augmentation', type=int, default=0, help='Set data augmentation or not for the problems - (default=False)')
+    parser.add_argument('--mnist_positive_negative_remapping', type=int, default=0, help='Remap MNIST data from [0,1] to [-1,1] range (default=1)')
 
-    # Setup workers and load modules
-    setup_julia_workers(n_workers)
-    
-    print("Julia setup complete!")
-    return Main.OIMSimulations
+    # Other parameters
+    parser.add_argument('--load_model', type=int, default=0, help='Load previously trained model (default=0)')
 
+    args = parser.parse_args()
+    print("\nArguments parsed successfully")
 
-# Parse arguments from command line
-parser = argparse.ArgumentParser(description='Binary Equilibrium Propagation with D-Wave support')\
+    # Initialize wandb if not disabled
+    if args.wandb_mode != 'disabled':
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            config=vars(args),
+            mode=args.wandb_mode
+        )
 
-parser.add_argument(
-    '--comparison', 
-    type=int,
-    default=0,
-    help='Comparison with hardcoded alternative annealing (default=0)')
-parser.add_argument(
-    '--simulation_type',
-    type=int,
-    default=0,
-    help='specify if we use OIM annealing (=0) or simulated annealing (=1) or scellier dynamics (2) (default=0)') # TODO LATER implement our own SA too?
+    print("Arguments:", args)
 
+    with torch.no_grad():
+        # Setup paths and tracking
+        print("\nSetting up paths and tracking...")
+        base_path = createPath(args)
+        dataframe = initDataframe(base_path)
+        print(f"Saving results to: {base_path}")
 
-parser.add_argument(
-    '--oim_duration',
-    type=float,
-    default=20.0,
-    help='Duration of the OIM simulation (default=20.0)')
-parser.add_argument(
-    '--oim_dt',
-    type=float,
-    default=0.1, # TODO change?
-    help='Time step of the OIM simulation (default=0.01)')
-parser.add_argument(
-    '--oim_noise',
-    type=int,
-    default=0,
-    help='Noise in the OIM simulation (default=0)')
-parser.add_argument(
-    '--oim_dynamics',
-    type=int,
-    default=0,
-    help='OIM Dynamics (Wang = 0, Simple = 1)')
-parser.add_argument(
-    '--rounding',
-    type=int,
-    default=0,
-    help='OIM Rounding to Ising spins (1) or keeping as soft cos(\phi_i) continuous variables (0) after anneal (default=1)')
-parser.add_argument(
-    '--oim_simple_rounding_only',
-    type=int,
-    default=0,
-    help='OIM Simple Rounding Only (default=0)')
-parser.add_argument(
-    '--N_data_train',
-    type=int,
-    default=1000, #60000 max
-    # default=10000,
-    help='Number of data points for training (default=1000)') 
-parser.add_argument(
-    '--N_data_test',
-    type=int,
-    default=100, #10000 max
-    # default=1000,
-    help='Number of data points for testing (default=100)')
-
-parser.add_argument(
-    '--epochs',
-    type=int,
-    default=50,
-    help='Number of epochs (default=10)')
-parser.add_argument(
-    '--layersList',
-    nargs='+',
-    type=int,
-    # default=[784, 10, 10],
-    # default=[784, 120, 40],
-    default=[784, 120, 10],
-    # default=[784, 500, 40],
-    help='List of layer sizes (default: [784, 120, 10])') # TODO NEXT try 10 with continuous
-parser.add_argument(
-    '--batch_size',
-    type=int,
-    default=4,
-    help='Size of mini-batches we use (for training only) (default=1)')
-parser.add_argument(
-    '--procs',
-    type=int,
-    default=40,
-    help='Total number of processors to use (default=40)')
-parser.add_argument(
-    '--beta',
-    type=float,
-    default=5,
-    help='Beta - hyperparameter of EP (default=5)') # TODO change this with continuous or not?
-parser.add_argument( # TODO LATER think about this clipping
-    '--h_clip',
-    type=float,
-    default=1.0, # Laydevant did 1.0
-    # default=10.0, 
-    help='Max limit for the amplitude of the local h applied to the oscillators, either for free or nudge phase - (default=1)')
-parser.add_argument( # TODO LATER think about this clipping
-    '--J_clip',
-    type=float,
-    default=1.0, # Laydevant did 1.0
-    # default=10.0,
-    help='Max limit for the amplitude of the local J applied to the oscillators, either for free or nudge phase - (default=1)')
-
-parser.add_argument(
-    '--Ks_max_nudge',
-    type=float,
-    default=0.25, # TODO maybe smaller beta factor or max nudge for continuous?
-    help='Maximum value of the Ks for the nudge phase (default=0.25)') # TODO LATER implement reverse annealing
-parser.add_argument(
-    '--frac_anneal_nudge',
-    type=float,
-    default=0.25,
-    help='fraction of SA system non-annealed (default=0.5, if <0.5: more annealing, if > 0.5, less annealing)')
-
-parser.add_argument(
-    '--n_iter_free',
-    type=int,
-    default=10,
-    help='Times to iterate for the OIM on a single data point for getting the minimal energy state of the free phase (default=10)')
-parser.add_argument(
-    '--n_iter_nudge',
-    type=int,
-    default=10, 
-    help='Times to iterate for the OIM on a single data point for getting the minimal energy state of the nudge phase (default=10)')
-parser.add_argument(
-    '--load_model',
-    type=int,
-    default=0,
-    help='If we load the parameters from a previously trained model to continue the training (default=0, else = 1)')
-
-
-parser.add_argument(
-    '--dataset',
-    type=str,
-    default='mnist',
-    help='Dataset we use for training (default=mnist, others: digits)')
-parser.add_argument(
-    '--data_augmentation',
-    type=int,
-    default=0,
-    help='Set data augmentation or not for the problems - (default=False)')
-parser.add_argument(
-    '--lrW0',
-    type=float,
-    default=0.01,
-    help='Learning rate for weights - input-hidden  (default=0.01)')
-parser.add_argument(
-    '--lrW1',
-    type=float,
-    default=0.01,
-    help='Learning rate for weights - hidden-output (default=0.01)')
-parser.add_argument(
-    '--lrB0',
-    type=float,
-    default=0.001,
-    help='Learning rate for biases - hidden (default=0.001)')
-parser.add_argument(
-    '--lrB1',
-    type=float,
-    default=0.001,
-    help='Learning rate for biases - output (default=0.001)')
-parser.add_argument(
-    '--gain_weight0',
-    type=float,
-    default=0.5,
-    help='Gain for initialization of the weights - input-hidden (default=1)')
-parser.add_argument(
-    '--gain_weight1',
-    type=float,
-    default=0.25,
-    help='Gain for initialization of the weights  - hidden-output (default=1)')
-
-
-
-args = parser.parse_args()
-
-# Print arguments
-print(args)
-print("Number of processors: ", args.procs)
-
-
-# Setup julia stuff if using OIM
-if args.simulated == 0:
-    OIMSimulations = setup_julia(n_workers=args.procs)
-
-
-
-
-
-with torch.no_grad():
-
-    ## Files saving: create a folder for the simulation and save simulation's parameters
-    BASE_PATH = createPath(args) # Create path to S-i folder
-    dataframe = initDataframe(BASE_PATH) # Create dataframe to store results in results.csv
-    print(BASE_PATH)
-
-
-    ## Generate DATA
-    if args.dataset == "digits":
-        train_loader, test_loader = generate_digits(args)
-    elif args.dataset == "mnist":
+        # Load MNIST dataset
+        # TODO try digits dataset too at some point
         train_loader, test_loader, dataset = generate_mnist(args)
 
-
-    ## Create the network
-    if args.load_model == 0:
-        net = Network(args)
-        saveHyperparameters(BASE_PATH, args)
-    else:
-        net = load_model_numpy(BASE_PATH)
-
-
-
-
-    ## Monitor loss and prediction error
-    train_loss_tab = np.zeros(args.epochs)
-    train_error_tab = np.zeros(args.epochs)
-    test_loss_tab = np.zeros(args.epochs)
-    test_error_tab = np.zeros(args.epochs)
-
-    for epoch in progressbars(range(args.epochs)):
-        print(f"Epoch {epoch+1}/{args.epochs}")
-        log_memory_usage()
-
-        if epoch > 0 and should_reset_workers():  # Skip first epoch check
-            reset_julia_workers(args.procs)
-            gc.collect()  # Force Python garbage collection after reset
-            OIMSimulations = Main.OIMSimulations  # Re-establish OIMSimulations after reset
-
-
-        # Train the network
-        # loss, error = train(net, args, train_loader, sampler)
-        if args.simulated == 1:
-            loss, error = train(net, args, train_loader, SimulatedAnnealingSampler())
+        # Initialize or load network
+        if args.load_model == 0:
+            net = Network(args)
+            saveHyperparameters(base_path, args)
         else:
-            loss, error = train_oim_julia_batch_parallel(net, args, train_loader, OIMSimulations)
-        train_loss_tab[epoch] = loss
-        train_error_tab[epoch] = error
+            net = load_model_numpy(base_path)
 
-        # Test the network
-        if args.simulated == 1:
-            loss, error = test(net, args, test_loader, SimulatedAnnealingSampler())
-        else:
-            loss, error = test(net, args, test_loader, OIMSimulations)
-        test_loss_tab[epoch] = loss
-        test_error_tab[epoch] = error
+        # Pre-allocate arrays for tracking
+        train_loss = np.zeros(args.epochs, dtype=np.float32)
+        train_error = np.zeros(args.epochs, dtype=np.float32)
+        test_loss = np.zeros(args.epochs, dtype=np.float32)
+        test_error = np.zeros(args.epochs, dtype=np.float32)
+        print("\nStarting training loop...")
 
-        # Store error and loss at each epoch
-        dataframe = updateDataframe(BASE_PATH, dataframe, np.array(train_error_tab)[epoch]/len(train_loader.dataset)*100, np.array(test_error_tab)[epoch]/len(test_loader.dataset)*100, train_loss_tab[epoch], test_loss_tab[epoch])
+        # Training loop
+        for epoch in progressbars(range(args.epochs), desc="Training Progress"):
+            print(f"\n{'='*20} Epoch {epoch+1}/{args.epochs} {'='*20}")
+            
+            
+            # Train
+            loss, error = train(net, args, train_loader)
+            train_loss[epoch] = loss
+            train_error[epoch] = error
 
-        save_model_numpy(BASE_PATH, net)
+            # Test
+            loss, error = test(net, args, test_loader)
+            test_loss[epoch] = loss
+            test_error[epoch] = error
 
+            # Log metrics to wandb if enabled
+            if args.wandb_mode != 'disabled':
+                wandb.log({
+                    'epoch': epoch,
+                    'train/loss': train_loss[epoch],
+                    'train/error': train_error[epoch]/len(train_loader.dataset)*100,
+                    'test/loss': test_loss[epoch],
+                    'test/error': test_error[epoch]/len(test_loader.dataset)*100,
+                    'network/weights_0_max': np.max(np.abs(net.weights_0)),
+                    'network/weights_1_max': np.max(np.abs(net.weights_1)),
+                    'network/bias_0_max': np.max(np.abs(net.bias_0)),
+                    'network/bias_1_max': np.max(np.abs(net.bias_1)),
+                    'network/sync_0_max': np.max(np.abs(net.sync_0)),
+                    'network/sync_1_max': np.max(np.abs(net.sync_1))
+                })
+
+            # Update tracking
+            dataframe = updateDataframe(
+                base_path, dataframe,
+                train_error[epoch]/len(train_loader.dataset)*100,
+                test_error[epoch]/len(test_loader.dataset)*100,
+                train_loss[epoch], test_loss[epoch]
+            )
+            
+            # Save model state
+            save_model_numpy(base_path, net)
+
+            # Print network statistics
+            print_network_stats(net, args)
+
+            # Memory cleanup
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Close wandb run if it was used
+        if args.wandb_mode != 'disabled':
+            wandb.finish()
+
+if __name__ == '__main__':
+    main()
 
 
