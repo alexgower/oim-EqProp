@@ -100,17 +100,16 @@ class Network(nn.Module):
             gradsW, gradsB, gradsSYNC = [], [], []
 
 
-            if args.simulation_type == 0 and args.rounding == 0: # i.e. for continuous OIM case
+            if args.simulation_type == 0: # i.e. for continuous OIM case
 
                 # Note this also assumes s = cos(\phi) from OIMs
                 # Note that grad_B and grad_SYNC use .sum(0) to sum over the batch dimension
-                # but grad_W uses .T to get the transpose of the input matrix so does automatically (TODO check this)
+                # but grad_W uses .T to get the transpose of the input matrix so does automatically 
 
                 ### HIDDEN LAYER LEARNABLE PARAMETERS
                 # Note for hidden layer weights since we use input matrix trick:
                 # If input s_i = cos(\phi_i) then implicitly we are assuming J_{ij} cos(\phi_i) cos(\phi_j)
                 # Therefore we must account for this in learning rule for hidden layer weights
-                # TODO check that this does column vector data.numpy().T * row vector cos(s_pos[0]) and not opposite way round
                 grad_W0 = -(-np.matmul(data.numpy().T, np.cos(s_pos[0])) + np.matmul(data.numpy().T, np.cos(s_neg[0]))) / coef
                 gradsW.append(grad_W0)
 
@@ -136,62 +135,54 @@ class Network(nn.Module):
                 grad_SYNC1 = -0.5 * (-np.cos(2*s_pos[1]) + np.cos(2*s_neg[1])).sum(0) / coef
                 gradsSYNC.append(grad_SYNC1)
 
-                # TODO remove
-                if args.debug:
-                    # Print relative changes and ranges for each parameter type and layer
-                    print("\nParameter Update Analysis:")
+
+            elif args.simulation_type == 1: # i.e. for Scellier case
+
+                # TODO do this
+                pass
+
+
+
+            if args.debug:
+                # Print relative changes and ranges for each parameter type and layer
+                print("\nParameter Update Analysis:")
+            
+                # Hidden layer (layer 0)
+                print("\nHidden Layer:")
+                print("Weights:")
+                rel_change_w0 = (args.lrW0 * gradsW[0]) / (self.weights_0 + 1e-10)  # Add small epsilon to avoid div by 0
+                print(f"  Relative change (min/max): {np.min(rel_change_w0):.6f} / {np.max(rel_change_w0):.6f}")
+                print(f"  Parameter range (min/max): {np.min(self.weights_0):.6f} / {np.max(self.weights_0):.6f}")
+                # print(" All relative changes:")
+                # for row in rel_change_w0:
+                #     print(' '.join(f'{x:8.6f}' for x in row))
                 
-                    # Hidden layer (layer 0)
-                    print("\nHidden Layer:")
-                    print("Weights:")
-                    rel_change_w0 = (args.lrW0 * gradsW[0]) / (self.weights_0 + 1e-10)  # Add small epsilon to avoid div by 0
-                    print(f"  Relative change (min/max): {np.min(rel_change_w0):.6f} / {np.max(rel_change_w0):.6f}")
-                    print(f"  Parameter range (min/max): {np.min(self.weights_0):.6f} / {np.max(self.weights_0):.6f}")
-                    # print(" All relative changes:")
-                    # for row in rel_change_w0:
-                    #     print(' '.join(f'{x:8.6f}' for x in row))
-                    
-                    print("Biases:")
-                    rel_change_b0 = (args.lrB0 * gradsB[0]) / (self.bias_0 + 1e-10)
-                    print(f"  Relative change (min/max): {np.min(rel_change_b0):.6f} / {np.max(rel_change_b0):.6f}")
-                    print(f"  Parameter range (min/max): {np.min(self.bias_0):.6f} / {np.max(self.bias_0):.6f}")
-                    
-                    print("Sync terms:")
-                    rel_change_s0 = (args.lrSYNC0 * gradsSYNC[0]) / (self.sync_0 + 1e-10)
-                    print(f"  Relative change (min/max): {np.min(rel_change_s0):.6f} / {np.max(rel_change_s0):.6f}")
-                    print(f"  Parameter range (min/max): {np.min(self.sync_0):.6f} / {np.max(self.sync_0):.6f}")
-                    
-                    # Output layer (layer 1) 
-                    print("\nOutput Layer:")
-                    print("Weights:")
-                    rel_change_w1 = (args.lrW1 * gradsW[1]) / (self.weights_1 + 1e-10)
-                    print(f"  Relative change (min/max): {np.min(rel_change_w1):.6f} / {np.max(rel_change_w1):.6f}")
-                    print(f"  Parameter range (min/max): {np.min(self.weights_1):.6f} / {np.max(self.weights_1):.6f}")
-                    
-                    print("Biases:")
-                    rel_change_b1 = (args.lrB1 * gradsB[1]) / (self.bias_1 + 1e-10)
-                    print(f"  Relative change (min/max): {np.min(rel_change_b1):.6f} / {np.max(rel_change_b1):.6f}")
-                    print(f"  Parameter range (min/max): {np.min(self.bias_1):.6f} / {np.max(self.bias_1):.6f}")
-                    
-                    print("Sync terms:")
-                    rel_change_s1 = (args.lrSYNC1 * gradsSYNC[1]) / (self.sync_1 + 1e-10)
-                    print(f"  Relative change (min/max): {np.min(rel_change_s1):.6f} / {np.max(rel_change_s1):.6f}")
-                    print(f"  Parameter range (min/max): {np.min(self.sync_1):.6f} / {np.max(self.sync_1):.6f}")
-
-            elif (args.simulation_type == 0 and args.rounding == 1) or args.simulation_type == 1:
-
-                # IN THIS CASE THE NEURON VALUES ARE ROUNDED AND WE TREAT SYNAPSES AS J_{ij} s_i s_j and field as h_i s_i
-                # TODO I THINK THIS USES +J and +h CONVENTIONS THOUGH SO MUST USE DIFFERENT DYNAMICS FUNCTION
-
-                # Input-hidden weights (layer 0)
-                gradsW.append(-(np.matmul(data.numpy().T, s[0]) - np.matmul(data.numpy().T, seq[0])) /coef)
-                # Hidden-output weights (layer 1)
-                gradsW.append(-(np.matmul(s[0].T, s[1]) - np.matmul(seq[0].T, seq[1])) /coef)
-
-                # Hidden layer biases (layer 0)
-                gradsB.append(-(s[0] - seq[0]).sum(0) /coef)
-                # Output layer biases (layer 1)
-                gradsB.append(-(s[1] - seq[1]).sum(0) /coef)
+                print("Biases:")
+                rel_change_b0 = (args.lrB0 * gradsB[0]) / (self.bias_0 + 1e-10)
+                print(f"  Relative change (min/max): {np.min(rel_change_b0):.6f} / {np.max(rel_change_b0):.6f}")
+                print(f"  Parameter range (min/max): {np.min(self.bias_0):.6f} / {np.max(self.bias_0):.6f}")
+                
+                print("Sync terms:")
+                rel_change_s0 = (args.lrSYNC0 * gradsSYNC[0]) / (self.sync_0 + 1e-10)
+                print(f"  Relative change (min/max): {np.min(rel_change_s0):.6f} / {np.max(rel_change_s0):.6f}")
+                print(f"  Parameter range (min/max): {np.min(self.sync_0):.6f} / {np.max(self.sync_0):.6f}")
+                
+                # Output layer (layer 1) 
+                print("\nOutput Layer:")
+                print("Weights:")
+                rel_change_w1 = (args.lrW1 * gradsW[1]) / (self.weights_1 + 1e-10)
+                print(f"  Relative change (min/max): {np.min(rel_change_w1):.6f} / {np.max(rel_change_w1):.6f}")
+                print(f"  Parameter range (min/max): {np.min(self.weights_1):.6f} / {np.max(self.weights_1):.6f}")
+                
+                print("Biases:")
+                rel_change_b1 = (args.lrB1 * gradsB[1]) / (self.bias_1 + 1e-10)
+                print(f"  Relative change (min/max): {np.min(rel_change_b1):.6f} / {np.max(rel_change_b1):.6f}")
+                print(f"  Parameter range (min/max): {np.min(self.bias_1):.6f} / {np.max(self.bias_1):.6f}")
+                
+                print("Sync terms:")
+                rel_change_s1 = (args.lrSYNC1 * gradsSYNC[1]) / (self.sync_1 + 1e-10)
+                print(f"  Relative change (min/max): {np.min(rel_change_s1):.6f} / {np.max(rel_change_s1):.6f}")
+                print(f"  Parameter range (min/max): {np.min(self.sync_1):.6f} / {np.max(self.sync_1):.6f}")
 
             return gradsW, gradsB, gradsSYNC
         

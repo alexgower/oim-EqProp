@@ -42,24 +42,24 @@ def main():
     parser.add_argument('--wandb_project', type=str, default='oim-eq-prop', help='WandB project name')
     parser.add_argument('--wandb_entity', type=str, default='alexgower-team', help='WandB entity/username')
     parser.add_argument('--wandb_name', type=str, default=None, help='WandB run name')
-    parser.add_argument('--wandb_mode', type=str, default='online', help='WandB mode (online/offline/disabled)')
+    parser.add_argument('--wandb_mode', type=str, default='disabled', help='WandB mode (online/offline/disabled)')
 
     # Simulation parameters
-    parser.add_argument('--simulation_type', type=int, default=0, help='Type of simulation, 0=OIM, 1=SA (default=0)')
-    parser.add_argument('--rounding', type=int, default=0, help='Rounding type (default=0)') # TODO theres no rounding in this current codebase
+    parser.add_argument('--simulation_type', type=int, default=0, help='Type of simulation, 0=OIM, 1=Scellier (default=0)')
     parser.add_argument('--exact_grads', type=int, default=0, help='Exact gradients calculated using RBP instead of EP (default=0)')
-    parser.add_argument('--debug', type=int, default=0, help='Debug mode (default=0)')
+    parser.add_argument('--debug', type=int, default=1, help='Debug mode (default=0)')
 
     # OIM dynamics parameters
-    parser.add_argument('--oim_duration', type=float, default=40.0, help='Duration of the OIM simulation (default=20.0)')
-    parser.add_argument('--oim_dt', type=float, default=0.2, help='Time step of the OIM simulation (default=0.1)')
+    parser.add_argument('--oim_duration', type=float, default=100.0, help='Duration of the OIM simulation (default=20.0)')
+    parser.add_argument('--oim_dt', type=float, default=0.01, help='Time step of the OIM simulation (default=0.1)')
     parser.add_argument('--oim_noise', type=int, default=0, help='Noise in the OIM simulation (default=0)')
     parser.add_argument('--oim_random_initialization', type=int, default=0, help='Random initialization of the OIM simulation as opposed to fixed pi/2 initialisation (default=1)')
     parser.add_argument('--nudge_reinitialisation', type=int, default=0, help='Nudge phase uses reinitialised phases (not free steady state phases) in the OIM simulation (default=1)')
     parser.add_argument('--n_procs', type=int, default=None, help='Number of processors for parallel processing (default=None)')
+    parser.add_argument('--ode_solver', type=str, default='RK', help='Type of ODE solver to use: Euler or RK (default: Euler)')
 
     # Network parameters
-    parser.add_argument('--layersList', nargs='+', type=int, default=[784, 500, 10], help='List of layer sizes (default: [784, 120, 40])')
+    parser.add_argument('--layersList', nargs='+', type=int, default=[784, 120, 10], help='List of layer sizes (default: [784, 120, 40])')
     parser.add_argument('--batch_size', type=int, default=40, help='Size of mini-batches (default=4)')
     parser.add_argument('--max_chunk_size', type=int, default=40, help='Size of chunks for parallel processing (default=20)')
     parser.add_argument('--beta', type=float, default=0.5, help='Beta - hyperparameter of EP (default=1.0)') # TODO think
@@ -84,8 +84,8 @@ def main():
     
     # Data parameters
     parser.add_argument('--dataset', type=str, default='mnist', help='Dataset to use, mnist or digits (default=mnist)')
-    parser.add_argument('--N_data_train', type=int, default=60000, help='Number of data points for training (default=10000)') 
-    parser.add_argument('--N_data_test', type=int, default=10000, help='Number of data points for testing (default=1000)')
+    parser.add_argument('--N_data_train', type=int, default=1000, help='Number of data points for training (default=10000)') 
+    parser.add_argument('--N_data_test', type=int, default=100, help='Number of data points for testing (default=1000)')
     parser.add_argument('--data_augmentation', type=int, default=0, help='Set data augmentation or not for the problems - (default=False)')
     parser.add_argument('--mnist_positive_negative_remapping', type=int, default=0, help='Remap MNIST data from [0,1] to [-1,1] range (default=1)')
 
@@ -152,15 +152,9 @@ def main():
                 wandb.log({
                     'epoch': epoch,
                     'train/loss': train_loss[epoch],
-                    'train/error': train_error[epoch]/len(train_loader.dataset)*100,
+                    'train/accuracy': train_error[epoch]/len(train_loader.dataset)*100,
                     'test/loss': test_loss[epoch],
-                    'test/error': test_error[epoch]/len(test_loader.dataset)*100,
-                    'network/weights_0_max': np.max(np.abs(net.weights_0)),
-                    'network/weights_1_max': np.max(np.abs(net.weights_1)),
-                    'network/bias_0_max': np.max(np.abs(net.bias_0)),
-                    'network/bias_1_max': np.max(np.abs(net.bias_1)),
-                    'network/sync_0_max': np.max(np.abs(net.sync_0)),
-                    'network/sync_1_max': np.max(np.abs(net.sync_1))
+                    'test/accuracy': test_error[epoch]/len(test_loader.dataset)*100,
                 })
 
             # Update tracking

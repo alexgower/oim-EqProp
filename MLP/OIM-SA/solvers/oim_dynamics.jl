@@ -4,6 +4,8 @@ using LinearAlgebra
 using Base.Threads
 using Random
 using Plots  # For visualization
+using DifferentialEquations
+using Statistics  # Add this for mean function
 
 # Print detailed thread information at module load
 println("\nJulia OIM solver initialized:")
@@ -16,34 +18,130 @@ export solve_batch_oim, solve_single_oim, test_oim_dynamics
 
 """
 Compute OIM dynamics for a single state vector.
-Optimized for Euler integration without noise.
+Optimized for maximum performance with SIMD, fastmath, and in-place operations.
 """
-function compute_dynamics!(du::Vector{Float64}, u::Vector{Float64}, 
+@fastmath function compute_dynamics!(du::Vector{Float64}, u::Vector{Float64}, 
                          J::Matrix{Float64}, h::Union{Vector{Float64},Nothing}, 
                          K_s::Union{Vector{Float64},Nothing})
     n = length(u)
     fill!(du, 0.0)
     
-    # Compute oscillator coupling terms directly
-    @simd for i in 1:n
+    # Compute oscillator coupling terms with optimized loops
+    @inbounds for i in 1:n
         du_sum = 0.0
         @simd for j in 1:n
-            du_sum -= J[i,j] * sin(u[i] - u[j])
+            if J[i,j] != 0  # Skip zero couplings
+                du_sum -= J[i,j] * sin(u[i] - u[j])
+            end
         end
         du[i] = du_sum
     end
     
     # External field (if provided)
     if !isnothing(h)
-        @. du -= h * sin(u)
+        @inbounds @simd for i in 1:n
+            du[i] -= h[i] * sin(u[i])
+        end
     end
     
     # SHIL sync (if provided)
     if !isnothing(K_s)
-        @. du -= K_s * sin(2 * u)
+        @inbounds @simd for i in 1:n
+            du[i] -= K_s[i] * sin(2 * u[i])
+        end
     end
     
     return du
+end
+
+"""
+Euler integration with fixed time step and history tracking.
+"""
+function euler_integration_with_history(u::Vector{Float64}, J::Matrix{Float64}, h::Union{Vector{Float64},Nothing}, K_s::Union{Vector{Float64},Nothing}, dt::Float64, duration::Float64)
+    n_steps = Int(round(duration/dt)) + 1
+    t_history = collect(range(0, duration, length=n_steps))
+    u_history = zeros(length(u), n_steps)
+    u_history[:, 1] = u
+    t = 0.0
+    step = 1
+    du = similar(u)
+    while t < duration
+        compute_dynamics!(du, u, J, h, K_s)
+        @. u += dt * du
+        t += dt
+        step += 1
+        if step <= n_steps
+            u_history[:, step] = u
+        end
+    end
+    return t_history, u_history
+end
+
+"""
+RK integration using DifferentialEquations.jl with adaptive time steps and history tracking.
+"""
+function rk_integration_with_history(u::Vector{Float64}, J::Matrix{Float64}, h::Union{Vector{Float64},Nothing}, K_s::Union{Vector{Float64},Nothing}, dt::Float64, duration::Float64)
+    # Package parameters into a named tuple
+    p = (J=J, h=h, K_s=K_s)
+    
+    # Pre-allocate the derivative vector
+    du = similar(u)
+    
+    function f_de(du::Vector{Float64}, u::Vector{Float64}, p, t::Float64)
+        compute_dynamics!(du, u, p.J, p.h, p.K_s)
+    end
+    
+    tspan = (0.0, duration)
+    prob = ODEProblem(f_de, u, tspan, p)
+    
+    # Option 1: BS3 with looser tolerances
+    # sol = solve(prob, BS3(), dt=dt, abstol=4e-2, reltol=2e-2, saveat=dt, adaptive=true, dtmax=dt*10)
+    
+    # Option 2: BS3 with tighter tolerances
+    sol = solve(prob, BS3(), dt=dt, abstol=1e-2, reltol=1e-2, saveat=dt, adaptive=true, dtmax=dt*5)
+    
+    # Option 3: Tsit5 with tighter tolerances
+    # sol = solve(prob, Tsit5(), dt=dt, abstol=1e-2, reltol=1e-2, saveat=dt, adaptive=true, dtmax=dt*5)
+    
+    t_history = sol.t
+    u_history = Array(sol)
+    return t_history, u_history
+end
+
+"""
+Fast Euler integration without saving history.
+"""
+function euler_integration(u::Vector{Float64}, J::Matrix{Float64}, h::Union{Vector{Float64},Nothing}, K_s::Union{Vector{Float64},Nothing}, dt::Float64, duration::Float64)
+    t = 0.0
+    du = similar(u)
+    while t < duration
+        compute_dynamics!(du, u, J, h, K_s)
+        @. u += dt * du
+        t += dt
+    end
+    return u
+end
+
+"""
+Fast RK integration using DifferentialEquations.jl without saving history.
+"""
+function rk_integration(u::Vector{Float64}, J::Matrix{Float64}, h::Union{Vector{Float64},Nothing}, K_s::Union{Vector{Float64},Nothing}, dt::Float64, duration::Float64)
+    p = (J=J, h=h, K_s=K_s)
+    
+    # Pre-allocate the derivative vector
+    du = similar(u)
+    
+    function f_de(du::Vector{Float64}, u::Vector{Float64}, p, t::Float64)
+        compute_dynamics!(du, u, p.J, p.h, p.K_s)
+    end
+    
+    tspan = (0.0, duration)
+    prob = ODEProblem(f_de, u, tspan, p)
+    
+    # Using BS3 with tighter tolerances and increased dtmax multiplier for better adaptivity
+    sol = solve(prob, BS3(), dt=dt, abstol=1e-2, reltol=1e-2, save_everystep=false, save_start=false, adaptive=true, dtmax=dt*50)
+    
+    return sol.u[end]
 end
 
 """
@@ -55,42 +153,29 @@ function solve_single_oim_with_history(J::Matrix{Float64},
                                      u0::Union{Vector{Float64},Nothing}=nothing,
                                      duration::Float64=20.0,
                                      dt::Float64=0.1,
-                                     random_initialization::Bool=true)
-    
+                                     random_initialization::Bool=true,
+                                     ode_solver::String="Euler")
     n = size(J, 1)
-    n_steps = Int(duration/dt) + 1
-    
+
     # Initialize state
     if isnothing(u0)
         if random_initialization
             # Set fixed seed for reproducibility
             Random.seed!(42)
-            u = rand(n) * 2π  # Random initial conditions between 0 and 2π
+            u = rand(n) * 2π
         else
-            u = fill(π/2, n)  # Fixed initial conditions
+            u = fill(π/2, n)
         end
     else
         u = copy(u0)
     end
     
-    # Pre-allocate arrays
-    du = similar(u)
-    t_history = collect(range(0, duration, length=n_steps))
-    u_history = zeros(n, n_steps)
-    u_history[:, 1] = u
-    
-    # Euler integration with history tracking
-    t = 0.0
-    step = 1
-    while t < duration
-        compute_dynamics!(du, u, J, h, K_s)
-        @. u += dt * du
-        t += dt
-        
-        if step < n_steps
-            step += 1
-            u_history[:, step] = u
-        end
+    if ode_solver == "Euler"
+        t_history, u_history = euler_integration_with_history(u, J, h, K_s, dt, duration)
+    elseif ode_solver == "RK"
+        t_history, u_history = rk_integration_with_history(u, J, h, K_s, dt, duration)
+    else
+        error("Unknown ode_solver option: $ode_solver")
     end
     
     return u, t_history, u_history
@@ -109,10 +194,11 @@ function solve_single_oim(J::Matrix{Float64},
                         phase::String="Free",
                         output_start_idx::Int=120,
                         random_initialization::Bool=true,
-                        target_idx=nothing)
+                        target_idx=nothing,
+                        ode_solver::String="Euler")
     
     if !make_plot
-        # Fast path without plotting - original implementation
+        # Fast path without plotting - use fast integration without saving history
         n = size(J, 1)
         
         # Initialize state
@@ -127,17 +213,14 @@ function solve_single_oim(J::Matrix{Float64},
         else
             u = copy(u0)
         end
-        
-        du = similar(u)
-        
-        # Euler integration
-        t = 0.0
-        while t < duration
-            compute_dynamics!(du, u, J, h, K_s)
-            @. u += dt * du
-            t += dt
+        if ode_solver == "Euler"
+            u_final = euler_integration(u, J, h, K_s, dt, duration)
+        elseif ode_solver == "RK"
+            u_final = rk_integration(u, J, h, K_s, dt, duration)
+        else
+            error("Unknown ode_solver option: $ode_solver")
         end
-        return u
+        return u_final
     else
         # Path with plotting enabled - use solve_single_oim_with_history
         u, t_history, u_history = solve_single_oim_with_history(
@@ -145,20 +228,43 @@ function solve_single_oim(J::Matrix{Float64},
             u0=u0,
             duration=duration,
             dt=dt,
-            random_initialization=random_initialization
+            random_initialization=random_initialization,
+            ode_solver=ode_solver
         )
         
         # Create plot using the existing plot_dynamics function
         plot_dynamics(t_history, u_history, 
                      phase=phase, 
                      output_start_idx=output_start_idx,
-                     target_idx=target_idx)  # Pass target_idx to plotting function
+                     target_idx=target_idx)
         return u
     end
 end
 
 """
-Solve a batch of OIM problems in parallel using threads.
+Calculate phase velocities for the current state.
+"""
+function calculate_phase_velocities(u::Vector{Float64}, J::Matrix{Float64}, h::Union{Vector{Float64},Nothing}, K_s::Union{Vector{Float64},Nothing})
+    du = similar(u)
+    compute_dynamics!(du, u, J, h, K_s)
+    return du
+end
+
+"""
+Calculate various metrics to assess convergence of the dynamics.
+"""
+function get_convergence_metrics(u::Vector{Float64}, J::Matrix{Float64}, h::Union{Vector{Float64},Nothing}, K_s::Union{Vector{Float64},Nothing})
+    velocities = calculate_phase_velocities(u, J, h, K_s)
+    return Dict(
+        "max_velocity" => maximum(abs.(velocities)),
+        "mean_velocity" => mean(abs.(velocities)),
+        "rms_velocity" => sqrt(mean(velocities.^2))
+    )
+end
+
+"""
+Solve OIM dynamics for a batch of problems in parallel.
+Now returns both final states and convergence metrics.
 """
 function solve_batch_oim(J_batch::Vector{Matrix{Float64}},
                         h_batch::Union{Vector{Vector{Float64}},Nothing}=nothing,
@@ -171,10 +277,12 @@ function solve_batch_oim(J_batch::Vector{Matrix{Float64}},
                         phase::String="Free",
                         output_start_idx::Int=120,
                         random_initialization::Bool=true,
-                        target_idx=nothing)
+                        target_idx::Union{Int,Nothing}=nothing,
+                        ode_solver::String="Euler")
     
     n_problems = length(J_batch)
     results = Vector{Vector{Float64}}(undef, n_problems)
+    metrics = Vector{Dict{String,Float64}}(undef, n_problems)
     
     # Determine number of threads to use
     max_threads = Threads.nthreads()
@@ -193,6 +301,7 @@ function solve_batch_oim(J_batch::Vector{Matrix{Float64}},
             K_s_i = isnothing(K_s_batch) ? nothing : K_s_batch[i]
             u0_i = isnothing(u0_batch) ? nothing : u0_batch[i]
             
+            # Solve single problem
             results[i] = solve_single_oim(
                 J_batch[i],
                 h_i,
@@ -204,12 +313,16 @@ function solve_batch_oim(J_batch::Vector{Matrix{Float64}},
                 phase=phase,
                 output_start_idx=output_start_idx,
                 random_initialization=random_initialization,
-                target_idx=target_idx
+                target_idx=target_idx,
+                ode_solver=ode_solver
             )
+            
+            # Calculate convergence metrics
+            metrics[i] = get_convergence_metrics(results[i], J_batch[i], h_i, K_s_i)
         end
     end
     
-    return results
+    return results, metrics
 end
 
 """
